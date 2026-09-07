@@ -21,18 +21,13 @@ def consume_from_batches(batches: list[Batch], quantity: float) -> None:
     """Deduct `quantity` from `batches` in FEFO order, in place.
 
     Batches with a known expiry_date are consumed soonest-first;
-    batches with no expiry_date are treated as expiring last. Raises
-    ValueError — without mutating anything — if `batches` don't hold
-    enough total quantity to satisfy the request.
+    batches with no expiry_date are treated as expiring last. If
+    `quantity` exceeds total stock, floors at zero rather than raising
+    — over-reporting consumption ("I used 6" when 5 were on record)
+    just means "none left," not a user error.
     """
     if quantity < 0:
         raise ValueError(f"quantity cannot be negative: {quantity}")
-
-    total_available = sum(b.quantity for b in batches)
-    if quantity > total_available:
-        raise ValueError(
-            f"cannot consume {quantity}; only {total_available} available"
-        )
 
     ordered = sorted(batches, key=lambda b: (b.expiry_date is None, b.expiry_date))
 

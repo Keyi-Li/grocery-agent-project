@@ -58,13 +58,22 @@ def test_consume_treats_no_expiry_batches_as_last():
     assert no_expiry.quantity == 4
 
 
-def test_consume_raises_and_does_not_mutate_when_insufficient_stock():
+def test_consume_floors_at_zero_when_over_requested():
     batch = make_batch(2, expiry_date=date(2026, 1, 16))
 
-    with pytest.raises(ValueError):
-        consume_from_batches([batch], 5)
+    consume_from_batches([batch], 5)  # over-reporting isn't an error
 
-    assert batch.quantity == 2
+    assert batch.quantity == 0
+
+
+def test_consume_floors_at_zero_across_multiple_batches():
+    first = make_batch(2, expiry_date=date(2026, 1, 16))
+    second = make_batch(1, expiry_date=date(2026, 1, 20))
+
+    consume_from_batches([first, second], 10)
+
+    assert first.quantity == 0
+    assert second.quantity == 0
 
 
 def test_consume_rejects_negative_quantity():

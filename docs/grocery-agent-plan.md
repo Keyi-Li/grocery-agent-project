@@ -2,10 +2,15 @@
 
 ## 1. Overview
 
-A voice-first grocery inventory assistant. Users speak to Siri (or an
-Android equivalent) to log purchases, log consumption, check stock,
-manage a shopping list, and get notified about food expiring soon.
-Multiple users can share one or more household inventories.
+A grocery inventory assistant, used via a household's Telegram group
+(text or a receipt photo) to log purchases, log consumption, check
+stock, manage a shopping list, and get notified about food expiring
+soon. Multiple users can share one or more household inventories.
+(Originally planned as voice-first via Siri; superseded post-v1 —
+Telegram text + photo turned out to cover the same scenarios without
+needing an on-device Shortcut or app. The backend itself is
+interface-agnostic, so a voice front end could still be added later
+with no backend changes.)
 
 **Core scenarios:**
 - "I bought apples: 3 units, pork: 1 pound, milk: 1 unit, best before
@@ -26,22 +31,22 @@ Multiple users can share one or more household inventories.
 ## 2. Architecture
 
 ```
-Siri Shortcut (iOS)  ─┐
-                       ├─▶ HTTPS ─▶ FastAPI backend ─▶ OpenRouter (tool-calling)
-Android equivalent   ─┘                 │
-                                         ├─▶ Supabase (Postgres + Auth)
-                                         └─▶ Telegram Bot API (reminders,
-                                             posted to the household's group)
+Telegram (text or receipt photo) ─▶ webhook ─▶ FastAPI backend ─▶ OpenRouter (tool-calling / vision)
+                                                     │
+                                                     ├─▶ Supabase (Postgres + Auth)
+                                                     └─▶ Telegram Bot API (reminders +
+                                                         confirmations, posted back to
+                                                         the household's group)
 ```
 
-- **Voice layer** is a thin, platform-specific shell (Siri Shortcut
-  captures dictation, POSTs text + user token to the backend, speaks
-  back the returned text). All real logic lives server-side, so the
-  same API can serve any platform capable of an HTTP call + TTS/STT
-  (Android via a Shortcuts-equivalent, a simple companion app, etc.).
+- **Front end is Telegram** — a household's own group chat, with the
+  bot as a member. Typed messages go through text parsing
+  (`grocery_agent/llm.py`); photo messages (a receipt) go through
+  vision parsing (`grocery_agent/receipt.py`) instead. All real logic
+  lives server-side; a `POST /utterance` endpoint also exists for
+  direct API testing/scripting, auth'd via a static `API_TOKEN`.
 - **Backend**: FastAPI (Python), hosted on **Fly.io** (free tier with
-  fast wake — important since Siri is a live round-trip and can't
-  tolerate a 30s+ cold start).
+  fast wake, so requests still feel responsive).
 - **Database + Auth**: **Supabase** free tier (Postgres, relational —
   fits the household/user/inventory/batch relationships naturally;
   free Auth handles multi-user login).
@@ -260,12 +265,11 @@ token) and the pending-clarification session state.
 **Tests:** `TestClient`/`httpx` hitting the endpoint, asserting
 correct response text and DB side effects.
 
-### Stage 7 — Voice integration + Telegram notifications
-Build the Siri Shortcut: capture dictation → POST to the deployed
-Fly.io endpoint → speak the response. Siri/Bixby's only role here is
-speech-to-text/text-to-speech — all understanding happens in Claude
-(Stage 5), so the same backend works no matter what language or
-mixed languages the user speaks in.
+### Stage 7 — Telegram integration + notifications
+Superseded plan: originally a Siri Shortcut (capture dictation → POST
+→ speak response), dropped post-v1 in favor of Telegram text/photo —
+simpler (no on-device Shortcut to build), and the backend was already
+interface-agnostic so nothing else had to change.
 
 Wire up the Telegram side (Section 3c): create the bot via
 `@BotFather`, add it to each household's group, and capture each
@@ -278,12 +282,35 @@ test harness: confirm a shared household item triggers a message in
 the household's Telegram group, visible to every member of that
 group.
 
+### Stage 8 — Sandboxed code-execution fallback
+
+Added after v1: rather than hand-writing a new tool for every gap
+found in real use (e.g. "clear all my stock"), the LLM has a
+`custom_action` tool as a last resort. It triggers a **second**,
+separate LLM call (`grocery_agent.sandbox.generate_code`) that writes
+a small Python function against a narrow, curated set of primitives
+(mirroring the Stage 4 tools — get/add/consume stock, shopping list
+ops) — never raw SQL, never the shell, never other secrets. That
+function runs inside an isolated **Modal Sandbox**, not our own
+process; the sandbox calls back into `/internal/sandbox/*` endpoints
+on our own deployed app via a short-lived, single-use token, so it
+never holds DB credentials itself. Every generated snippet is logged
+to `ActionLog` (audit trail) and its result reaches the user like any
+other response — this is "compose existing primitives in new ways,"
+not "let the model do anything."
+
+Caveat found in practice: the codegen call must independently be told
+about item-name canonicalization (Section 3a) — it doesn't inherit
+that instruction from the main parser automatically, since it's a
+separate LLM call with its own prompt (`grocery_agent/sandbox.py`,
+`_CODEGEN_PROMPT`).
+
 ## 6. Open Items for Later (v2+)
 - Scheduled (non-request-triggered) expiry/staleness check, for
-  catching thresholds on days with no voice activity (v1 only checks
-  opportunistically when the backend is touched).
-- Android/Bixby equivalent front-end (same backend, no changes
-  needed — Bixby's role, like Siri's, is only speech-to-text/
-  text-to-speech).
+  catching thresholds on days with no Telegram activity (v1 only
+  checks opportunistically when the backend is touched).
+- A voice front end (Siri Shortcut or similar) — dropped from the plan
+  post-v1 in favor of Telegram, but the backend is interface-agnostic
+  so this could be re-added without backend changes if wanted later.
 - Smarter LLM features beyond parsing (recipe suggestions from stock,
   waste-reduction tips) — explicitly deferred per current scope.

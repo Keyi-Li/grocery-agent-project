@@ -46,9 +46,13 @@ Start by reading the plan and PROGRESS.md, then begin with Stage 1.
 ## What to expect
 
 - Claude Code will read the plan and `PROGRESS.md`, then work through
-  Stages 1–7 **one at a time**, in the bottom-up order defined in the
+  the stages **one at a time**, in the bottom-up order defined in the
   plan (domain models → core logic → persistence → tool functions →
-  LLM parsing → API → voice integration).
+  LLM parsing → API → Telegram integration). Note: the plan has since
+  evolved past its original Stage 1–7 scope — see `PROGRESS.md` for
+  what's actually been built (Telegram/receipt input replaced the
+  originally-planned Siri Shortcut, plus a sandboxed code-execution
+  fallback was added).
 - After each stage, it will run pytest and show you the results, then
   explain what it built and why, then explicitly wait for you to say
   you understand before continuing.

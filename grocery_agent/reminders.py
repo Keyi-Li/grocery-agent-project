@@ -42,7 +42,7 @@ def run_reminder_check(conn: psycopg.Connection, household_id: str) -> list[str]
 
             if is_expiring_soon(batch, today):
                 if reminder_repo.get(batch.id, "expiry") is None:  # one-time only
-                    message = f"{item.name} is expiring soon ({batch.expiry_date})."
+                    message = f"{item.name} 快过期了（{batch.expiry_date}）。"
                     send_telegram_message(household.telegram_chat_id, message)
                     reminder_repo.upsert(batch.id, "expiry", last_sent_at=now)
                     sent.append(message)
@@ -54,10 +54,7 @@ def run_reminder_check(conn: psycopg.Connection, household_id: str) -> list[str]
                     and (now - state["last_sent_at"]).days >= STALENESS_REPEAT_DAYS
                 )
                 if due:
-                    message = (
-                        f"{item.name} has been sitting unused for a while — "
-                        "still got it?"
-                    )
+                    message = f"{item.name} 放了很久没动，还在吗？"
                     send_telegram_message(household.telegram_chat_id, message)
                     reminder_repo.upsert(batch.id, "staleness", last_sent_at=now)
                     sent.append(message)

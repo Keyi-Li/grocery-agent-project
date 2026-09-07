@@ -130,8 +130,30 @@ def query_stock(
     result = []
     for item in items:
         total, unit = _summarize(inventory_repo.get_batches(household_id, item.id))
+        if total <= 0:
+            continue  # fully consumed — omit rather than show "0 eggs"
         result.append({"name": item.name, "quantity": total, "unit": unit})
     return result
+
+
+def query_batch_details(
+    conn: psycopg.Connection, household_id: str, name: str
+) -> list[dict]:
+    """Per-batch detail for one item — purchase date, expiry date,
+    quantity — for questions query_stock can't answer since it only
+    returns an aggregate total (e.g. "when did I buy the milk?")."""
+    inventory_repo = InventoryRepository(conn)
+    item = inventory_repo.get_or_create_item(name)
+    return [
+        {
+            "quantity": b.quantity,
+            "unit": b.unit,
+            "purchase_date": b.purchase_date,
+            "expiry_date": b.expiry_date,
+        }
+        for b in inventory_repo.get_batches(household_id, item.id)
+        if b.quantity > 0
+    ]
 
 
 def query_shopping_list(

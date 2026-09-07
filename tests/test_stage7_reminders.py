@@ -138,7 +138,6 @@ def test_staleness_reminder_repeats_after_interval(
 
     # Simulate the repeat interval having elapsed.
     reminder_repo = ReminderStateRepository(db_conn)
-    state = reminder_repo.get(batch.id, "staleness")
     reminder_repo.upsert(
         batch.id,
         "staleness",

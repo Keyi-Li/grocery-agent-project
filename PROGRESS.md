@@ -103,6 +103,69 @@ you like to consume?" instead of guessing). This is now the
 recommended default going forward unless cost becomes a real concern
 at much higher volume than personal use.
 
+**Update 2026-09-07 (later still): several real fixes + a language migration.**
+- query_stock no longer lists fully-consumed items as "0 eggs" — omits
+  them entirely (grocery_agent/tools.py).
+- Responses are one item per line, in Chinese (grocery_agent/api.py
+  _format_response — item names stay whatever canonical form the DB
+  has; unit words translated via _UNIT_ZH).
+- **Item names now canonicalize to Chinese, not English** — a
+  household consistency request. RESPONSE_LANGUAGE (.env) now drives
+  both the clarification language AND the canonical item-name
+  language (must be one fixed language, not "mirror input," or the
+  same item in two languages would create two DB rows). Migrated all
+  existing real item rows to Chinese in one pass (apple->苹果 etc.);
+  also fixed pre-existing duplicate "cookie"/"cookies" rows (merged)
+  and deleted a stray empty "pingu" row (debug leftover, zero
+  batches, harmless). **Real bug caught during this**: RESPONSE_LANGUAGE
+  was added to local .env but never pushed as a Fly secret, so the
+  deployed app was silently still using English — re-ran
+  `fly secrets import` to fix; also cleaned up one duplicate "apple"
+  item this gap created before the fix landed.
+- System prompt compacted (was 4 verbose paragraphs, now ~5 sentences)
+  and now includes today's date, fixing a real bug: "best before
+  August 31" was resolving to a date in the past (model had no sense
+  of "now").
+- Pending-clarification resolution now sends a real 3-turn message
+  list (user/assistant/user) to the model instead of one hand-mashed
+  string — cleaner and likely more reliable.
+- **Real bug: multi-item utterances were silently dropping items.**
+  "一块面包，一盒饼干" (bread + cookies) only ever executed the first
+  tool call — parse_utterance took message.tool_calls[0] and discarded
+  the rest. ParsedCommand now holds a list of ToolCall entries (kept
+  .tool_name/.arguments as convenience properties for the common
+  single-call case); api.py's _process_utterance loops over all calls
+  and commits once at the end.
+- **Found while fixing the above — serious model reliability issue**:
+  qwen/qwen3.7-flash sometimes returns the *same* tool call repeated
+  3-6 times in one response (confirmed reproducible: 5 identical
+  requests came back as 1, 6, 2, 1, and 4 calls). This isn't just
+  flaky — it silently double/triple-inserted real inventory during
+  live testing. Added defensive deduplication in parse_utterance
+  (collapses identical (tool, args) pairs) as a safety net regardless
+  of model, but the underlying model behavior is the real concern.
+  Also seeing qwen3.7-flash's upstream (Alibaba's shared free pool on
+  OpenRouter) rate-limit more often in testing (3 failures in one test
+  run, vs 1 earlier). Flagged to user for a model-choice decision —
+  see chat for the comparison; claude-haiku-4.5 via OpenRouter remains
+  the proven-reliable fallback if the user wants to prioritize
+  correctness over cost.
+- consume_from_batches (services.py) no longer raises when asked to
+  consume more than is in stock — floors at zero instead. Over-
+  reporting consumption ("I used 6" when 5 were on record) isn't a
+  user error, it just means "none left."
+
+**Update 2026-09-07 (later still): unit display simplified to 份 universally**,
+per user request ("I think you can use 份 universally") — every item's
+display now shows a generic 份 (portion/unit) regardless of its actual
+stored unit; lb/kg/pack/etc. stay precise in the DB, this is display-only.
+Removed the per-unit Chinese translation table (_UNIT_ZH) from api.py.
+
+**Model choice: deferred, not resolved.** User said "let's deal with
+model choice later" — still on qwen/qwen3.7-flash despite the
+duplicate-call/rate-limit findings above. Revisit when asked; don't
+assume it's been decided either way.
+
 Original model decision (2026-09-06, superseded above): compared several cheap OpenRouter models
 by real pricing + live latency + a quick correctness check, given the
 household's actual bilingual English/Chinese use. Settled on
@@ -185,3 +248,88 @@ for this household instead of no-op'ing.
 Siri Shortcut — manual on-device build, steps in
 docs/siri-shortcut-setup.md. Use https://grocery-agent-koi.fly.dev
 as the URL and SIRI_SHORTCUT_TOKEN from .env as the bearer token.
+
+## Stage 8 — Sandboxed code-execution fallback (added post-v1)
+Status: complete
+Completed: 2026-09-07
+Notes: grocery_agent/sandbox.py — for requests matching no predefined
+tool, a `custom_action` tool (grocery_agent/llm.py TOOLS) triggers a
+*second*, separate LLM call (generate_code) that writes a small Python
+`def run(ctx): ...` using only a curated primitive set mirroring the
+Stage 4 tools (get_stock/add_item/consume_item/add_to_shopping_list/
+get_shopping_list/get_expiring_soon) — no raw SQL, no shell, no other
+imports (validate_generated_code rejects import/open/exec/eval/
+subprocess/os as defense-in-depth on top of sandbox isolation). Runs
+inside an isolated Modal Sandbox (real modal.com account, MODAL_TOKEN_ID/
+MODAL_TOKEN_SECRET in .env), which calls back into new
+/internal/sandbox/* endpoints on our own deployed app via a
+short-lived single-use token (grocery_agent.sandbox.issue_sandbox_token)
+— the sandbox never holds DB credentials or any other secret. Every
+run is logged to ActionLog (action="custom_action", details include
+the generated code + result) for auditability.
+
+Real bug caught during live testing (not caught by the unit tests,
+which mock the sandbox boundary): the codegen prompt didn't know about
+the Chinese item-name canonicalization rule (Section 3a) — it's a
+*separate* LLM call from the main parser with its own prompt, so it
+doesn't inherit that instruction automatically. First live test
+("如果我的梨少于5个，就把梨加到购物清单") generated code using `name="pear"`
+(English), which silently failed to match the DB's "梨" row, so the
+shopping-list add never happened despite a successful-looking
+response. Fixed by adding the same canonicalization instruction to
+_CODEGEN_PROMPT, parameterized by RESPONSE_LANGUAGE like the main
+prompt. Confirmed working after the fix (generates `ctx.get_stock("梨")`
+correctly). Also found: qwen3.7-flash inconsistently routes to
+custom_action vs. an existing tool for the same ambiguous phrasing
+(2/3 local retries picked query_stock instead) — same underlying
+model-reliability question as Stage 5, still deferred per user.
+
+Tests: tests/test_stage8_sandbox.py, 17 tests — validate_generated_code
+unit tests, sandbox token round-trip, a real Modal Sandbox execution
+(no network), a real codegen LLM call, real DB-backed tests of every
+/internal/sandbox/* endpoint via TestClient, and dispatch integration
+tests with run_in_sandbox mocked (the actual Modal-to-deployed-app
+network round trip isn't practical to test automatically — verified
+manually against the live deployed app instead, see above).
+
+Also verified end-to-end against the live deployed app: real codegen +
+real Modal sandbox + real callback to https://grocery-agent-koi.fly.dev
++ real DB mutation, confirmed via a follow-up query_shopping_list call.
+
+## Stage 9 — Receipt photo parsing + Siri removal (2026-09-07)
+Status: complete
+Notes: Per user decision, Siri dropped entirely (docs/siri-shortcut-setup.md
+deleted; SIRI_SHORTCUT_TOKEN/SIRI_DEFAULT_USER_ID renamed to generic
+API_TOKEN/API_DEFAULT_USER_ID, since /utterance is now just a
+testing/scripting entry point — Telegram is the real front end).
+grocery_agent/receipt.py: sending a photo to the household's Telegram
+group downloads it (notifications.download_telegram_file, Telegram's
+two-step file API), sends it to a vision-capable model (VISION_MODEL,
+default google/gemini-2.5-flash — qwen3.7-flash isn't vision-capable)
+with a prompt mirroring the main parser's canonicalization rule, and
+converts the result into add_item ToolCalls dispatched through the
+same _execute_calls path as text (refactored out of _process_utterance
+so both paths share it). Verified live: real receipt photo → real
+vision call → real items added, in Chinese canonical form.
+
+Also fixed two real bugs found via user reports while building this:
+- **query_batch_details** (new tool) — "when did I buy X" had no tool
+  to answer it at all; query_stock only ever returned an aggregate
+  total, never purchase_date. Added a per-batch detail tool exposing
+  purchase_date/expiry_date/quantity.
+- **Unit-enum crash risk** — the model can return a unit outside
+  ALLOWED_UNITS despite the tool schema declaring an enum (observed:
+  Chinese measure words "块"/"盒") — Batch's own validation would have
+  hard-crashed add_item. _coerce_arguments now falls back to "unit"
+  for anything out-of-enum rather than erroring.
+- **custom_action over-triggering**: adding that tool made the model
+  sometimes route ordinary multi-item requests through it instead of
+  multiple add_item calls (4/5 in one local test run). Tightened the
+  system prompt: "one call per item/action... custom_action is a LAST
+  RESORT ONLY... never use it for something a normal tool call already
+  handles." Confirmed fixed (5/5 correct after).
+
+Tests: tests/test_stage9_receipt.py (3, incl. a real vision-model call
+against a synthetic fixture receipt), plus new tests in
+test_stage4_tools.py (query_batch_details) and test_stage6_api.py
+(unit fallback). Full suite: 103 passed.

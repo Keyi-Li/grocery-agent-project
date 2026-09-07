@@ -15,6 +15,7 @@ from grocery_agent.tools import (
     add_item,
     add_to_shopping_list,
     consume_item,
+    query_batch_details,
     query_expiring_soon,
     query_shopping_list,
     query_stock,
@@ -33,7 +34,7 @@ def household_and_user(db_conn):
 def test_add_item_creates_batch_and_logs_action(db_conn, household_and_user):
     household, user = household_and_user
 
-    batch = add_item(db_conn, household.id, user.id, "apple", 3, unit="unit")
+    add_item(db_conn, household.id, user.id, "apple", 3, unit="unit")
 
     stock = query_stock(db_conn, household.id, "apple")
     assert stock == [{"name": "apple", "quantity": 3, "unit": "unit"}]
@@ -70,6 +71,19 @@ def test_consume_item_to_zero_auto_adds_to_shopping_list(db_conn, household_and_
 
     item = InventoryRepository(db_conn).get_or_create_item("eggs")
     assert entries[0].item_id == item.id
+
+
+def test_query_stock_omits_fully_consumed_items(db_conn, household_and_user):
+    household, user = household_and_user
+    add_item(db_conn, household.id, user.id, "eggs", 1)
+    add_item(db_conn, household.id, user.id, "milk", 2)
+    consume_item(db_conn, household.id, user.id, "eggs", 1)
+
+    everything = query_stock(db_conn, household.id)
+    assert everything == [{"name": "milk", "quantity": 2, "unit": "unit"}]
+
+    named = query_stock(db_conn, household.id, "eggs")
+    assert named == []  # empty, not [{"name": "eggs", "quantity": 0, ...}]
 
 
 def test_add_to_shopping_list_is_manual_and_idempotent(db_conn, household_and_user):
@@ -120,3 +134,27 @@ def test_query_expiring_soon_only_returns_near_expiry_batches(
     expiring = query_expiring_soon(db_conn, household.id)
 
     assert [e["name"] for e in expiring] == ["yogurt"]
+
+
+def test_query_batch_details_returns_purchase_and_expiry_dates(db_conn, household_and_user):
+    household, user = household_and_user
+    add_item(
+        db_conn,
+        household.id,
+        user.id,
+        "cheese",
+        1,
+        expiry_date=date.today() + timedelta(days=10),
+    )
+
+    details = query_batch_details(db_conn, household.id, "cheese")
+
+    assert len(details) == 1
+    assert details[0]["quantity"] == 1
+    assert details[0]["purchase_date"] == date.today()
+    assert details[0]["expiry_date"] == date.today() + timedelta(days=10)
+
+
+def test_query_batch_details_empty_for_unknown_item(db_conn, household_and_user):
+    household, _user = household_and_user
+    assert query_batch_details(db_conn, household.id, "nonexistent-item") == []

@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 import grocery_agent.api as api_module
 from grocery_agent.dataclass import Household, User
 from grocery_agent.db import get_connection
-from grocery_agent.llm import ParsedCommand
+from grocery_agent.llm import ParsedCommand, ToolCall
 from grocery_agent.repositories import HouseholdRepository, UserRepository
 
 
@@ -84,9 +84,9 @@ def client(household_and_user):
         api_module._pending_clarifications.clear()
 
 
-def test_static_siri_token_maps_to_configured_user(monkeypatch):
-    monkeypatch.setenv("SIRI_SHORTCUT_TOKEN", "test-secret")
-    monkeypatch.setenv("SIRI_DEFAULT_USER_ID", "user-123")
+def test_static_api_token_maps_to_configured_user(monkeypatch):
+    monkeypatch.setenv("API_TOKEN", "test-secret")
+    monkeypatch.setenv("API_DEFAULT_USER_ID", "user-123")
 
     user = api_module.verify_supabase_token(authorization="Bearer test-secret")
 
@@ -99,13 +99,35 @@ def test_missing_auth_header_returns_401():
     assert response.status_code == 401
 
 
+def test_coerce_arguments_falls_back_to_unit_for_out_of_enum_value():
+    # The tool schema declares a unit enum, but not every model actually
+    # enforces it (observed: Chinese measure words like "块"/"盒") —
+    # Batch's own validation would hard-crash on an out-of-enum unit.
+    coerced = api_module._coerce_arguments("add_item", {"name": "面包", "quantity": 1, "unit": "块"})
+    assert coerced["unit"] == "unit"
+
+
+def test_add_item_with_bad_unit_does_not_crash(client, monkeypatch):
+    monkeypatch.setattr(
+        api_module,
+        "parse_utterance",
+        lambda text: ParsedCommand(
+            calls=[ToolCall("add_item", {"name": "面包", "quantity": 1, "unit": "块"})]
+        ),
+    )
+
+    response = client.post("/utterance", json={"text": "一块面包"})
+
+    assert response.status_code == 200
+    assert "面包" in response.json()["response"]
+
+
 def test_add_item_end_to_end(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
         lambda text: ParsedCommand(
-            tool_name="add_item",
-            arguments={"name": "apple", "quantity": 3, "unit": "unit"},
+            calls=[ToolCall("add_item", {"name": "apple", "quantity": 3, "unit": "unit"})]
         ),
     )
 
@@ -116,13 +138,42 @@ def test_add_item_end_to_end(client, monkeypatch):
     assert "apple" in response.json()["response"]
 
 
+def test_multiple_calls_in_one_utterance_are_all_executed(client, monkeypatch):
+    monkeypatch.setattr(
+        api_module,
+        "parse_utterance",
+        lambda text: ParsedCommand(
+            calls=[
+                ToolCall("add_item", {"name": "bread", "quantity": 1, "unit": "unit"}),
+                ToolCall("add_item", {"name": "cookie", "quantity": 1, "unit": "pack"}),
+            ]
+        ),
+    )
+
+    response = client.post("/utterance", json={"text": "一块面包，一盒饼干"})
+
+    assert response.status_code == 200
+    lines = response.json()["response"].splitlines()
+    assert len(lines) == 2
+    assert any("bread" in line for line in lines)
+    assert any("cookie" in line for line in lines)
+
+    monkeypatch.setattr(
+        api_module,
+        "parse_utterance",
+        lambda text: ParsedCommand(calls=[ToolCall("query_stock", {})]),
+    )
+    stock = client.post("/utterance", json={"text": "what do I have"}).json()["response"]
+    assert "bread" in stock
+    assert "cookie" in stock
+
+
 def test_query_stock_after_add(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
         lambda text: ParsedCommand(
-            tool_name="add_item",
-            arguments={"name": "milk", "quantity": 2, "unit": "unit"},
+            calls=[ToolCall("add_item", {"name": "milk", "quantity": 2, "unit": "unit"})]
         ),
     )
     client.post("/utterance", json={"text": "I bought 2 milk"})
@@ -130,7 +181,7 @@ def test_query_stock_after_add(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(tool_name="query_stock", arguments={}),
+        lambda text: ParsedCommand(calls=[ToolCall("query_stock", {})]),
     )
     response = client.post("/utterance", json={"text": "what do I have"})
 
@@ -147,8 +198,7 @@ def test_clarification_flow_resolves_on_next_utterance(
         api_module,
         "parse_utterance",
         lambda text: ParsedCommand(
-            tool_name="add_item",
-            arguments={"name": "apple", "quantity": 5, "unit": "unit"},
+            calls=[ToolCall("add_item", {"name": "apple", "quantity": 5, "unit": "unit"})]
         ),
     )
     client.post("/utterance", json={"text": "I bought 5 apples"})
@@ -156,9 +206,7 @@ def test_clarification_flow_resolves_on_next_utterance(
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(
-            tool_name=None, clarification="How many apples did you eat?"
-        ),
+        lambda text: ParsedCommand(calls=[], clarification="How many apples did you eat?"),
     )
     first = client.post("/utterance", json={"text": "I ate an apple"})
     assert first.json()["response"] == "How many apples did you eat?"
@@ -168,17 +216,18 @@ def test_clarification_flow_resolves_on_next_utterance(
 
     def fake_parse(text):
         seen_text["value"] = text
-        return ParsedCommand(
-            tool_name="consume_item", arguments={"name": "apple", "quantity": 1}
-        )
+        return ParsedCommand(calls=[ToolCall("consume_item", {"name": "apple", "quantity": 1})])
 
     monkeypatch.setattr(api_module, "parse_utterance", fake_parse)
     second = client.post("/utterance", json={"text": "one"})
 
     assert second.status_code == 200
     assert "1" in second.json()["response"]
-    assert "I ate an apple" in seen_text["value"]
-    assert "one" in seen_text["value"]
+    assert seen_text["value"] == [
+        {"role": "user", "content": "I ate an apple"},
+        {"role": "assistant", "content": "How many apples did you eat?"},
+        {"role": "user", "content": "one"},
+    ]
     assert not api_module._pending_clarifications  # cleared after resolving
 
 
@@ -198,8 +247,7 @@ def test_response_is_also_sent_to_telegram_when_household_has_a_chat_id(
         api_module,
         "parse_utterance",
         lambda text: ParsedCommand(
-            tool_name="add_item",
-            arguments={"name": "bread", "quantity": 1, "unit": "unit"},
+            calls=[ToolCall("add_item", {"name": "bread", "quantity": 1, "unit": "unit"})]
         ),
     )
 
@@ -229,8 +277,7 @@ def test_telegram_webhook_processes_message_and_replies(
         api_module,
         "parse_utterance",
         lambda text: ParsedCommand(
-            tool_name="add_item",
-            arguments={"name": "tofu", "quantity": 1, "unit": "unit"},
+            calls=[ToolCall("add_item", {"name": "tofu", "quantity": 1, "unit": "unit"})]
         ),
     )
 
@@ -243,7 +290,7 @@ def test_telegram_webhook_processes_message_and_replies(
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert sent == [("-100888", "Added 1 tofu.")]
+    assert sent == [("-100888", "已添加 1 份 tofu。")]
 
 
 def test_telegram_webhook_rejects_wrong_secret(monkeypatch):

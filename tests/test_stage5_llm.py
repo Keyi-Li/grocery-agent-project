@@ -1,7 +1,10 @@
 """Tests for Stage 5 LLM parsing layer (grocery_agent.llm).
 
-These call the real Claude API (ANTHROPIC_API_KEY from .env) — no
+These call the real OpenRouter API (OPENROUTER_API_KEY from .env) — no
 mocking, since this stage's whole job is the model's behavior.
+
+Item names canonicalize to RESPONSE_LANGUAGE (Chinese, per .env), not
+English — see grocery_agent.llm._system_prompt.
 """
 
 from grocery_agent.llm import parse_utterance
@@ -11,7 +14,7 @@ def test_add_item_with_full_details():
     result = parse_utterance("I bought apples: 3 units, best before August 31")
 
     assert result.tool_name == "add_item"
-    assert result.arguments["name"] == "apple"
+    assert result.arguments["name"] == "苹果"
     assert result.arguments["quantity"] == 3
     assert result.arguments["expiry_date"]
 
@@ -20,7 +23,7 @@ def test_consume_item():
     result = parse_utterance("I ate one apple")
 
     assert result.tool_name == "consume_item"
-    assert result.arguments["name"] == "apple"
+    assert result.arguments["name"] == "苹果"
     assert result.arguments["quantity"] == 1
 
 
@@ -28,14 +31,14 @@ def test_add_to_shopping_list():
     result = parse_utterance("Add eggs to my list")
 
     assert result.tool_name == "add_to_shopping_list"
-    assert result.arguments["name"] == "egg"
+    assert result.arguments["name"] == "鸡蛋"
 
 
 def test_query_stock_specific_item():
     result = parse_utterance("How much milk do I have?")
 
     assert result.tool_name == "query_stock"
-    assert result.arguments.get("name") == "milk"
+    assert result.arguments.get("name") == "牛奶"
 
 
 def test_query_stock_everything():
@@ -64,9 +67,29 @@ def test_ambiguous_consume_asks_for_clarification():
     assert result.clarification
 
 
-def test_multilingual_item_name_normalizes_to_canonical_english():
-    result = parse_utterance("我吃了一个苹果")  # "I ate one apple"
+def test_item_name_canonicalizes_consistently_across_languages():
+    english = parse_utterance("I ate one apple")
+    chinese = parse_utterance("我吃了一个苹果")  # "I ate one apple"
 
-    assert result.tool_name == "consume_item"
-    assert result.arguments["name"] == "apple"
-    assert result.arguments["quantity"] == 1
+    assert english.arguments["name"] == chinese.arguments["name"] == "苹果"
+    assert english.arguments["quantity"] == chinese.arguments["quantity"] == 1
+
+
+def test_multiple_items_in_one_utterance_produce_multiple_calls():
+    result = parse_utterance("一块面包，一盒饼干")  # a loaf of bread, a pack of cookies
+
+    assert len(result.calls) == 2
+    assert all(c.tool_name == "add_item" for c in result.calls)
+    names = {c.arguments["name"] for c in result.calls}
+    assert names == {"面包", "饼干"}
+
+
+def test_duplicate_tool_calls_are_deduplicated():
+    # Cheap models occasionally repeat the exact same call multiple times
+    # in one response (observed: a 2-item request coming back as 4-6
+    # duplicated calls) — run several times since it's non-deterministic,
+    # and assert the dedup in parse_utterance always collapses it.
+    for _ in range(5):
+        result = parse_utterance("一块面包，一盒饼干")
+        keys = [(c.tool_name, tuple(sorted(c.arguments.items()))) for c in result.calls]
+        assert len(keys) == len(set(keys)), f"duplicate calls slipped through: {result.calls}"
