@@ -1,4 +1,4 @@
-"""Stage 8 — sandboxed code-execution fallback.
+"""Sandboxed code-execution fallback.
 
 For requests that don't fit any predefined tool (e.g. "clear all my
 stock"), a second LLM call writes a small Python function against a
@@ -50,13 +50,13 @@ def run(ctx):
 
 `ctx` has these methods and ONLY these — no other functions, imports, file access, \
 or network calls are available or allowed:
-- ctx.get_stock(name=None) -> list of {{"name": str, "quantity": float, "unit": str}} \
+- ctx.get_stock(name=None) -> list of {{"name": str, "quantity": float}} \
 (all items in stock, or just `name` if given; empty list if none)
-- ctx.add_item(name, quantity, unit="unit", expiry_date=None) -> records a purchase
+- ctx.add_item(name, quantity, expiry_date=None) -> records a purchase
 - ctx.consume_item(name, quantity) -> deducts from stock (floors at zero, never errors)
 - ctx.add_to_shopping_list(name) -> adds an item to the shopping list
 - ctx.get_shopping_list() -> list of item names on the shopping list
-- ctx.get_expiring_soon() -> list of {{"name", "quantity", "unit", "expiry_date"}}
+- ctx.get_expiring_soon() -> list of {{"name", "quantity", "expiry_date"}}
 
 Item names in this system are stored in canonical {language} (e.g. "milk" is \
 stored as its {language} word), regardless of what language the request used. \
@@ -155,10 +155,10 @@ class Context:
     def get_stock(self, name=None):
         return _call("get_stock", {"name": name})["items"]
 
-    def add_item(self, name, quantity, unit="unit", expiry_date=None):
+    def add_item(self, name, quantity, expiry_date=None):
         return _call(
             "add_item",
-            {"name": name, "quantity": quantity, "unit": unit, "expiry_date": expiry_date},
+            {"name": name, "quantity": quantity, "expiry_date": expiry_date},
         )
 
     def consume_item(self, name, quantity):

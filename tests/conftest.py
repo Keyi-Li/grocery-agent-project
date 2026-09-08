@@ -1,4 +1,4 @@
-"""Shared fixtures for persistence tests (Stage 3+).
+"""Shared fixtures for persistence-backed tests.
 
 Runs against the real Supabase project configured in .env: schema is
 applied once per test session (idempotent CREATE TABLE IF NOT EXISTS),

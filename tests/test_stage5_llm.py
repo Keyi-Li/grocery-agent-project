@@ -1,7 +1,7 @@
-"""Tests for Stage 5 LLM parsing layer (grocery_agent.llm).
+"""Tests for the LLM parsing layer (grocery_agent.llm).
 
 These call the real OpenRouter API (OPENROUTER_API_KEY from .env) — no
-mocking, since this stage's whole job is the model's behavior.
+mocking, since the whole point is verifying the model's behavior.
 
 Item names canonicalize to RESPONSE_LANGUAGE (Chinese, per .env), not
 English — see grocery_agent.llm._system_prompt.
@@ -58,6 +58,13 @@ def test_query_expiring_soon():
     result = parse_utterance("What's expiring soon?")
 
     assert result.tool_name == "query_expiring_soon"
+
+
+def test_query_item_details():
+    result = parse_utterance("When did I buy the milk?")
+
+    assert result.tool_name == "query_item_details"
+    assert result.arguments.get("name") == "牛奶"
 
 
 def test_ambiguous_consume_asks_for_clarification():

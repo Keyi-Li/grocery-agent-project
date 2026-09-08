@@ -1,4 +1,4 @@
-"""One-time helper for Stage 7 setup (plan Section 3c).
+"""One-time helper for Telegram setup.
 
 Usage: create your household's Telegram group, add the bot to it,
 send any message in the group, then run this script — it prints the

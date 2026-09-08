@@ -1,81 +1,75 @@
-"""Tests for Stage 6 API layer (grocery_agent.api).
+"""Tests for the API layer (grocery_agent.api).
 
-The LLM parsing step (Stage 5, already tested against the real Claude
-API in test_stage5_llm.py) is monkeypatched here with fixed
-ParsedCommand results — this stage's job is the API plumbing (auth,
-dispatch, pending-clarification state), not re-verifying the model's
-parsing quality. Auth is overridden via FastAPI's dependency_overrides
-so tests don't need a live Supabase Auth session. Everything else
-(the DB, tool functions, services) is real, same as earlier stages.
+The LLM parsing step (already tested against the real model in
+test_stage5_llm.py) is monkeypatched here with fixed ParsedCommand
+results, and generate_reply (also LLM-backed — see test_stage5_llm.py
+for its own live tests) is replaced with a deterministic fake that
+just dumps the facts as JSON — the focus here is API plumbing (auth,
+dispatch, pending-clarification state, fact resolution), not
+re-verifying the model's wording. /utterance auth is overridden via
+FastAPI's dependency_overrides. Everything else (the DB, tool
+functions, services) is real.
 """
+
+import json
 
 import pytest
 from fastapi.testclient import TestClient
 
 import grocery_agent.api as api_module
-from grocery_agent.dataclass import Household, User
+from grocery_agent.dataclass import Household
 from grocery_agent.db import get_connection
 from grocery_agent.llm import ParsedCommand, ToolCall
-from grocery_agent.repositories import HouseholdRepository, UserRepository
+from grocery_agent.repositories import HouseholdRepository
+
+
+def _fake_generate_reply(context, facts):
+    # One line per fact, matching what the real prompt asks the model
+    # to do — lets tests assert per-item lines deterministically.
+    return "\n".join(json.dumps(f, ensure_ascii=False) for f in facts)
 
 
 @pytest.fixture
-def household_and_user(db_conn):
+def household(db_conn):
     # The API endpoint opens its own connection per request, so this
     # fixture must commit (db_conn's usual rollback-after-test isolation
     # doesn't apply here) — cleaned up explicitly in the finally block.
-    # households cascade-delete batches/shopping_list_entries/action_log/
-    # household_members; items (the shared catalog) are left in place,
-    # same as in real use.
-    user = User(email="api-test@example.com")
-    UserRepository(db_conn).create(user)
-    household = Household(name="API Test Household", member_ids=[user.id])
+    household = Household(name="API Test Household")
     HouseholdRepository(db_conn).create(household)
     db_conn.commit()
     try:
-        yield household, user
+        yield household
     finally:
         cleanup_conn = get_connection()
         try:
             with cleanup_conn.cursor() as cur:
                 cur.execute("DELETE FROM households WHERE id = %s", (household.id,))
-                cur.execute("DELETE FROM users WHERE id = %s", (user.id,))
             cleanup_conn.commit()
         finally:
             cleanup_conn.close()
 
 
 @pytest.fixture
-def household_and_user_with_telegram(db_conn):
-    user = User(email="api-telegram-test@example.com")
-    UserRepository(db_conn).create(user)
-    household = Household(
-        name="API Telegram Test Household",
-        member_ids=[user.id],
-        telegram_chat_id="-100888",
-    )
+def household_with_telegram(db_conn):
+    household = Household(name="API Telegram Test Household", telegram_chat_id="-100888")
     HouseholdRepository(db_conn).create(household)
     db_conn.commit()
     try:
-        yield household, user
+        yield household
     finally:
         cleanup_conn = get_connection()
         try:
             with cleanup_conn.cursor() as cur:
                 cur.execute("DELETE FROM households WHERE id = %s", (household.id,))
-                cur.execute("DELETE FROM users WHERE id = %s", (user.id,))
             cleanup_conn.commit()
         finally:
             cleanup_conn.close()
 
 
 @pytest.fixture
-def client(household_and_user):
-    _household, user = household_and_user
-
-    api_module.app.dependency_overrides[api_module.verify_supabase_token] = (
-        lambda: api_module.AuthenticatedUser(id=user.id, email=user.email)
-    )
+def client(household, monkeypatch):
+    monkeypatch.setattr(api_module, "generate_reply", _fake_generate_reply)
+    api_module.app.dependency_overrides[api_module.verify_api_token] = lambda: household.id
     api_module._pending_clarifications.clear()
     try:
         yield TestClient(api_module.app)
@@ -84,13 +78,21 @@ def client(household_and_user):
         api_module._pending_clarifications.clear()
 
 
-def test_static_api_token_maps_to_configured_user(monkeypatch):
+def test_verify_api_token_returns_configured_household(monkeypatch):
     monkeypatch.setenv("API_TOKEN", "test-secret")
-    monkeypatch.setenv("API_DEFAULT_USER_ID", "user-123")
+    monkeypatch.setenv("API_DEFAULT_HOUSEHOLD_ID", "household-123")
 
-    user = api_module.verify_supabase_token(authorization="Bearer test-secret")
+    household_id = api_module.verify_api_token(authorization="Bearer test-secret")
 
-    assert user.id == "user-123"
+    assert household_id == "household-123"
+
+
+def test_verify_api_token_rejects_wrong_token(monkeypatch):
+    monkeypatch.setenv("API_TOKEN", "test-secret")
+    monkeypatch.setenv("API_DEFAULT_HOUSEHOLD_ID", "household-123")
+
+    with pytest.raises(Exception):
+        api_module.verify_api_token(authorization="Bearer wrong")
 
 
 def test_missing_auth_header_returns_401():
@@ -99,36 +101,11 @@ def test_missing_auth_header_returns_401():
     assert response.status_code == 401
 
 
-def test_coerce_arguments_falls_back_to_unit_for_out_of_enum_value():
-    # The tool schema declares a unit enum, but not every model actually
-    # enforces it (observed: Chinese measure words like "块"/"盒") —
-    # Batch's own validation would hard-crash on an out-of-enum unit.
-    coerced = api_module._coerce_arguments("add_item", {"name": "面包", "quantity": 1, "unit": "块"})
-    assert coerced["unit"] == "unit"
-
-
-def test_add_item_with_bad_unit_does_not_crash(client, monkeypatch):
-    monkeypatch.setattr(
-        api_module,
-        "parse_utterance",
-        lambda text: ParsedCommand(
-            calls=[ToolCall("add_item", {"name": "面包", "quantity": 1, "unit": "块"})]
-        ),
-    )
-
-    response = client.post("/utterance", json={"text": "一块面包"})
-
-    assert response.status_code == 200
-    assert "面包" in response.json()["response"]
-
-
 def test_add_item_end_to_end(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(
-            calls=[ToolCall("add_item", {"name": "apple", "quantity": 3, "unit": "unit"})]
-        ),
+        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "apple", "quantity": 3})]),
     )
 
     response = client.post("/utterance", json={"text": "I bought 3 apples"})
@@ -138,14 +115,34 @@ def test_add_item_end_to_end(client, monkeypatch):
     assert "apple" in response.json()["response"]
 
 
+def test_add_item_with_explicit_purchase_date(client, monkeypatch):
+    monkeypatch.setattr(
+        api_module,
+        "parse_utterance",
+        lambda text: ParsedCommand(
+            calls=[
+                ToolCall(
+                    "add_item",
+                    {"name": "rice", "quantity": 1, "purchase_date": "2026-01-01"},
+                )
+            ]
+        ),
+    )
+
+    response = client.post("/utterance", json={"text": "I bought rice on Jan 1"})
+
+    assert response.status_code == 200
+    assert "rice" in response.json()["response"]
+
+
 def test_multiple_calls_in_one_utterance_are_all_executed(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
         lambda text: ParsedCommand(
             calls=[
-                ToolCall("add_item", {"name": "bread", "quantity": 1, "unit": "unit"}),
-                ToolCall("add_item", {"name": "cookie", "quantity": 1, "unit": "pack"}),
+                ToolCall("add_item", {"name": "bread", "quantity": 1}),
+                ToolCall("add_item", {"name": "cookie", "quantity": 1}),
             ]
         ),
     )
@@ -172,9 +169,7 @@ def test_query_stock_after_add(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(
-            calls=[ToolCall("add_item", {"name": "milk", "quantity": 2, "unit": "unit"})]
-        ),
+        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "milk", "quantity": 2})]),
     )
     client.post("/utterance", json={"text": "I bought 2 milk"})
 
@@ -188,18 +183,12 @@ def test_query_stock_after_add(client, monkeypatch):
     assert "milk" in response.json()["response"]
 
 
-def test_clarification_flow_resolves_on_next_utterance(
-    client, household_and_user, monkeypatch
-):
-    _household, user = household_and_user
-
+def test_clarification_flow_resolves_on_next_utterance(client, household, monkeypatch):
     # Seed stock first so the later consume_item has something to deduct.
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(
-            calls=[ToolCall("add_item", {"name": "apple", "quantity": 5, "unit": "unit"})]
-        ),
+        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "apple", "quantity": 5})]),
     )
     client.post("/utterance", json={"text": "I bought 5 apples"})
 
@@ -210,7 +199,7 @@ def test_clarification_flow_resolves_on_next_utterance(
     )
     first = client.post("/utterance", json={"text": "I ate an apple"})
     assert first.json()["response"] == "How many apples did you eat?"
-    assert user.id in api_module._pending_clarifications
+    assert "api-test" in api_module._pending_clarifications
 
     seen_text = {}
 
@@ -232,23 +221,21 @@ def test_clarification_flow_resolves_on_next_utterance(
 
 
 def test_response_is_also_sent_to_telegram_when_household_has_a_chat_id(
-    household_and_user_with_telegram, monkeypatch
+    household_with_telegram, monkeypatch
 ):
-    _household, user = household_and_user_with_telegram
-    api_module.app.dependency_overrides[api_module.verify_supabase_token] = (
-        lambda: api_module.AuthenticatedUser(id=user.id, email=user.email)
+    api_module.app.dependency_overrides[api_module.verify_api_token] = (
+        lambda: household_with_telegram.id
     )
     api_module._pending_clarifications.clear()
     sent = []
     monkeypatch.setattr(
         api_module, "send_telegram_message", lambda chat_id, text: sent.append((chat_id, text))
     )
+    monkeypatch.setattr(api_module, "generate_reply", _fake_generate_reply)
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(
-            calls=[ToolCall("add_item", {"name": "bread", "quantity": 1, "unit": "unit"})]
-        ),
+        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "bread", "quantity": 1})]),
     )
 
     try:
@@ -264,33 +251,70 @@ def test_response_is_also_sent_to_telegram_when_household_has_a_chat_id(
     assert sent[0][1] == response.json()["response"]
 
 
-def test_telegram_webhook_processes_message_and_replies(
-    household_and_user_with_telegram, monkeypatch
-):
-    household, _user = household_and_user_with_telegram
+def test_telegram_webhook_processes_message_and_replies(household_with_telegram, monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "test-webhook-secret")
     sent = []
     monkeypatch.setattr(
         api_module, "send_telegram_message", lambda chat_id, text: sent.append((chat_id, text))
     )
+    monkeypatch.setattr(api_module, "generate_reply", _fake_generate_reply)
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(
-            calls=[ToolCall("add_item", {"name": "tofu", "quantity": 1, "unit": "unit"})]
-        ),
+        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "tofu", "quantity": 1})]),
     )
 
     with TestClient(api_module.app) as client:
         response = client.post(
             "/telegram-webhook",
-            json={"message": {"chat": {"id": -100888}, "text": "I bought tofu"}},
+            json={
+                "message": {
+                    "chat": {"id": -100888},
+                    "text": "I bought tofu",
+                    "from": {"id": 42, "first_name": "Koi"},
+                }
+            },
             headers={"x-telegram-bot-api-secret-token": "test-webhook-secret"},
         )
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert sent == [("-100888", "已添加 1 份 tofu。")]
+    assert len(sent) == 1
+    assert sent[0][0] == "-100888"
+    assert "tofu" in sent[0][1]
+
+
+def test_telegram_webhook_attributes_action_to_sender(household_with_telegram, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "test-webhook-secret")
+    monkeypatch.setattr(api_module, "send_telegram_message", lambda chat_id, text: None)
+    monkeypatch.setattr(api_module, "generate_reply", _fake_generate_reply)
+    monkeypatch.setattr(
+        api_module,
+        "parse_utterance",
+        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "tofu", "quantity": 1})]),
+    )
+
+    with TestClient(api_module.app) as client:
+        client.post(
+            "/telegram-webhook",
+            json={
+                "message": {
+                    "chat": {"id": -100888},
+                    "text": "I bought tofu",
+                    "from": {"id": 42, "first_name": "Koi"},
+                }
+            },
+            headers={"x-telegram-bot-api-secret-token": "test-webhook-secret"},
+        )
+
+    from grocery_agent.repositories import ActionLogRepository
+
+    conn = get_connection()
+    try:
+        logs = ActionLogRepository(conn).get_for_household(household_with_telegram.id)
+        assert logs[-1]["user_id"] == "Koi (42)"
+    finally:
+        conn.close()
 
 
 def test_telegram_webhook_rejects_wrong_secret(monkeypatch):

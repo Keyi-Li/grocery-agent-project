@@ -1,14 +1,12 @@
-"""Stage 5 — LLM parsing layer.
+"""LLM parsing layer.
 
-Turns a raw voice utterance into a selected Stage-4 tool call (name +
-arguments) or a clarifying question, using OpenRouter's OpenAI-
-compatible tool-calling API. See docs/grocery-agent-plan.md Section 4
-(tool definitions, ambiguity handling) and Section 3a (multilingual
-normalization).
+Turns a raw utterance into a tool call (name + arguments) or a
+clarifying question, using OpenRouter's OpenAI-compatible tool-calling
+API.
 
-Uses OpenRouter rather than calling Anthropic directly — a deliberate
-choice for this project (existing OpenRouter credit; this parsing task
-is simple enough that a cheap model is plenty).
+Uses OpenRouter rather than calling a model provider directly — a
+deliberate choice for this project (existing OpenRouter credit; this
+parsing task is simple enough that a cheap model is plenty).
 """
 
 from __future__ import annotations
@@ -20,8 +18,6 @@ from datetime import date
 
 from dotenv import load_dotenv
 from openai import OpenAI
-
-from grocery_agent.dataclass import ALLOWED_UNITS
 
 load_dotenv()
 
@@ -45,7 +41,9 @@ _PROMPT = (
     '(Chinese "一"/"两" = 1/2) — always resolve to a number, never ask for '
     "clarification just because a number was spelled out. Resolve partial or "
     "relative dates (e.g. \"August 31\") against today's date, picking the next "
-    "upcoming occurrence.\n\n"
+    "upcoming occurrence — this applies to both purchase_date and expiry_date. "
+    "If no purchase date is mentioned or discernible (e.g. from a receipt), "
+    "omit purchase_date entirely rather than guessing; it defaults to today.\n\n"
     "custom_action is a LAST RESORT ONLY, for requests no combination of the "
     "other tools above can satisfy (e.g. 'clear all my stock', conditional "
     "logic). Never use it for something a normal tool call (or several) "
@@ -72,13 +70,17 @@ TOOLS = [
                         "description": "Canonical item name.",
                     },
                     "quantity": {"type": "number"},
-                    "unit": {"type": "string", "enum": sorted(ALLOWED_UNITS)},
+                    "purchase_date": {
+                        "type": "string",
+                        "description": "ISO date (YYYY-MM-DD), only if mentioned or "
+                        "shown on a receipt — omit to default to today.",
+                    },
                     "expiry_date": {
                         "type": "string",
                         "description": "ISO date (YYYY-MM-DD), only if mentioned.",
                     },
                 },
-                "required": ["name", "quantity", "unit"],
+                "required": ["name", "quantity"],
             },
         },
     },
@@ -124,9 +126,9 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "query_batch_details",
+            "name": "query_item_details",
             "description": (
-                "Per-batch detail for one item — purchase date, expiry date, "
+                "Per-purchase detail for one item — purchase date, expiry date, "
                 "quantity. Use this for questions query_stock can't answer since "
                 "it only gives a total (e.g. 'when did I buy the milk?', 'how old "
                 "is the beef?')."
@@ -237,20 +239,57 @@ def parse_utterance(
     message = response.choices[0].message
 
     if message.tool_calls:
-        calls = []
-        seen = set()
-        for c in message.tool_calls:
-            arguments = json.loads(c.function.arguments) if c.function.arguments else {}
-            # Cheaper models occasionally repeat the exact same call
-            # (seen: a 2-item utterance coming back as 4-6 duplicated
-            # calls) — an identical (tool, args) pair twice in one
-            # response is a model glitch, never an intentional repeat.
-            key = (c.function.name, tuple(sorted(arguments.items())))
-            if key in seen:
-                continue
-            seen.add(key)
-            calls.append(ToolCall(tool_name=c.function.name, arguments=arguments))
+        calls = [
+            ToolCall(
+                tool_name=c.function.name,
+                arguments=json.loads(c.function.arguments) if c.function.arguments else {},
+            )
+            for c in message.tool_calls
+        ]
         return ParsedCommand(calls=calls)
 
     clarification = (message.content or "").strip()
     return ParsedCommand(calls=[], clarification=clarification or None)
+
+
+_REPLY_PROMPT = (
+    "Report these grocery-inventory facts to the household. They relate to: "
+    "{context}\n\n"
+    "Write ONE short, concise message, in the same language as that request "
+    "if it's natural-language text — otherwise (e.g. a receipt photo, or a "
+    "proactive reminder with no request behind it) use {fallback_language}. "
+    "Item names below are stored in a fixed canonical form — express them "
+    "naturally in the reply's language rather than copying that form "
+    "verbatim if it doesn't match.\n\n"
+    'Style: terse and information-dense, e.g. "苹果 +3" for an addition, '
+    '"牛奶 -1" for a consumption, "牛奶 purchased 2026-01-01, expires '
+    '2026-01-05" for a detail lookup, "牛奶 快过期了（2026-01-05）" for an '
+    'expiry reminder, or "苹果 放了很久没动，还在吗？" for a staleness '
+    "reminder. One line per fact if there are several. No pleasantries, no "
+    "explanations — just the facts."
+)
+
+
+def generate_reply(
+    context: str | None, facts: list[dict], client: OpenAI | None = None
+) -> str:
+    """Turns the raw facts of what just happened (Python-resolved, since
+    only Python has DB access) into the actual reply text — the LLM
+    decides wording/language, not a hardcoded template."""
+    client = client or _client()
+    model = os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
+    fallback_language = os.environ.get("RESPONSE_LANGUAGE", "").strip() or "English"
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": _REPLY_PROMPT.format(
+                    context=context or "(no specific request)", fallback_language=fallback_language
+                ),
+            },
+            {"role": "user", "content": json.dumps(facts, ensure_ascii=False, default=str)},
+        ],
+    )
+    return (response.choices[0].message.content or "").strip()

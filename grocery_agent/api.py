@@ -1,9 +1,13 @@
-"""Stage 6 — API layer.
+"""API layer.
 
-FastAPI app exposing POST /utterance: send text, get a spoken-back
-response back. Handles Supabase-token auth and the short-lived
-pending-clarification session state. See docs/grocery-agent-plan.md
-Section 2 (API), Section 3d and Section 4 (pending clarification).
+FastAPI app exposing POST /utterance (testing/scripting) and
+POST /telegram-webhook (the front end: text or a receipt photo, sent
+in the household's Telegram group).
+
+Identity comes directly from Telegram (message.from.id/first_name),
+not a separate auth system. /utterance is a scripting/testing entry
+point authenticated by a static token, mapped to one fixed household —
+it is not the production path; Telegram is.
 """
 
 from __future__ import annotations
@@ -13,15 +17,13 @@ import time
 from dataclasses import dataclass
 from datetime import date as date_cls
 
-import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from grocery_agent import receipt, sandbox, tools
-from grocery_agent.dataclass import ALLOWED_UNITS
 from grocery_agent.db import get_connection
-from grocery_agent.llm import parse_utterance
+from grocery_agent.llm import generate_reply, parse_utterance
 from grocery_agent.notifications import download_telegram_file, send_telegram_message
 from grocery_agent.reminders import run_reminder_check
 from grocery_agent.repositories import (
@@ -40,8 +42,8 @@ def health():
     return {"status": "ok"}
 
 # A pending clarification is one bounded record per user — replaced or
-# cleared on the next utterance, never a growing transcript (plan
-# Section 3d). Process-local: fine for a single Fly.io instance.
+# cleared on the next utterance, never a growing transcript.
+# Process-local: fine for a single Fly.io instance.
 PENDING_CLARIFICATION_TTL_SECONDS = 120
 _pending_clarifications: dict[str, "PendingClarification"] = {}
 
@@ -51,7 +53,7 @@ TOOL_FUNCTIONS = {
     "consume_item": tools.consume_item,
     "add_to_shopping_list": tools.add_to_shopping_list,
     "query_stock": tools.query_stock,
-    "query_batch_details": tools.query_batch_details,
+    "query_item_details": tools.query_item_details,
     "query_shopping_list": tools.query_shopping_list,
     "query_expiring_soon": tools.query_expiring_soon,
 }
@@ -64,73 +66,29 @@ class PendingClarification:
     asked_at: float
 
 
-@dataclass
-class AuthenticatedUser:
-    id: str
-    email: str
-
-
 class UtteranceRequest(BaseModel):
     text: str
 
 
-def verify_supabase_token(
-    authorization: str | None = Header(default=None),
-) -> AuthenticatedUser:
-    """Validates the caller's bearer token one of two ways:
-
-    1. A static API_TOKEN, mapped directly to API_DEFAULT_USER_ID (set
-       by scripts/setup_household.py) — for testing/scripting against
-       /utterance directly. The primary client (Telegram) doesn't use
-       this path at all; it's routed by chat id instead.
-    2. Otherwise, a real Supabase Auth access token, verified by
-       asking Supabase's own Auth server whose token it is. This path
-       is what any future real client (a proper mobile app, a web UI)
-       would use instead.
-
-    Overridden in tests via FastAPI dependency_overrides so tests
-    don't need a live Supabase Auth session."""
+def verify_api_token(authorization: str | None = Header(default=None)) -> str:
+    """/utterance is a testing/scripting entry point, not the production
+    path (Telegram is, routed by chat id below) — a static token mapped
+    to one fixed household is all it needs. Returns the household id."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     token = authorization.removeprefix("Bearer ")
 
     api_token = os.environ.get("API_TOKEN")
-    api_user_id = os.environ.get("API_DEFAULT_USER_ID")
-    if api_token and api_user_id and token == api_token:
-        return AuthenticatedUser(id=api_user_id, email="")
-
-    response = httpx.get(
-        f"{os.environ['SUPABASE_URL']}/auth/v1/user",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "apikey": os.environ["SUPABASE_ANON_KEY"],
-        },
-        timeout=10,
-    )
-    if response.status_code != 200:
+    household_id = os.environ.get("API_DEFAULT_HOUSEHOLD_ID")
+    if not api_token or not household_id or token != api_token:
         raise HTTPException(status_code=401, detail="invalid token")
-    data = response.json()
-    return AuthenticatedUser(id=data["id"], email=data.get("email", ""))
-
-
-def _get_household_id(conn, user_id: str) -> str:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT household_id FROM household_members WHERE user_id = %s LIMIT 1",
-            (user_id,),
-        )
-        row = cur.fetchone()
-    if row is None:
-        raise HTTPException(status_code=400, detail="user belongs to no household")
-    return row[0]
+    return household_id
 
 
 def _notify_telegram_confirmation(conn, household_id: str, text: str) -> None:
-    """Posts every /utterance response (not just reminders) to the
-    household's Telegram group, best-effort. This lets a non-Siri
-    client (e.g. an Android IFTTT/Assistant routine that can fire a
-    one-way webhook but can't speak a response back) read the
-    confirmation in Telegram instead."""
+    """Posts every response (not just reminders) to the household's
+    Telegram group, best-effort — lets a client that can only fire a
+    one-way webhook (no speech synthesis) read the confirmation there."""
     try:
         household = HouseholdRepository(conn).get(household_id)
         if household and household.telegram_chat_id:
@@ -142,74 +100,60 @@ def _notify_telegram_confirmation(conn, household_id: str, text: str) -> None:
 def _coerce_arguments(tool_name: str, arguments: dict) -> dict:
     arguments = dict(arguments)
     if tool_name == "add_item":
-        if arguments.get("expiry_date"):
-            arguments["expiry_date"] = date_cls.fromisoformat(arguments["expiry_date"])
-        if arguments.get("unit") not in ALLOWED_UNITS:
-            # The tool schema declares an enum, but not every model
-            # actually enforces it (seen: "块"/"盒", Chinese measure
-            # words) — Batch's own validation would hard-crash on an
-            # out-of-enum unit, so fall back rather than error out.
-            arguments["unit"] = "unit"
+        for date_field in ("purchase_date", "expiry_date"):
+            if arguments.get(date_field):
+                arguments[date_field] = date_cls.fromisoformat(arguments[date_field])
     return arguments
 
 
-def _format_quantity(quantity: float) -> str:
-    return str(int(quantity)) if quantity == int(quantity) else str(quantity)
-
-
-def _item_line(name: str, quantity: float) -> str:
-    """份 (a generic "portion/unit") is used for every item's display,
-    regardless of its actual stored unit (lb/kg/pack/etc. stay precise
-    in the DB — this is a display simplification, not a storage one)."""
-    return f"{_format_quantity(quantity)} 份 {name}"
-
-
-def _format_response(conn, tool_name: str, arguments: dict, result) -> str:
-    """All deterministic (non-LLM-generated) responses are in Chinese,
-    regardless of what language the utterance was in — item names stay
-    in their canonical form from the DB (Section 3a), not translated
-    per response."""
-    if tool_name == "add_item":
-        return f"已添加 {_item_line(arguments['name'], arguments['quantity'])}。"
-    if tool_name == "consume_item":
-        return f"已记录消耗 {_item_line(arguments['name'], arguments['quantity'])}。"
-    if tool_name == "add_to_shopping_list":
-        return f"已将 {arguments['name']} 加入购物清单。"
+def _call_to_fact(conn, tool_name: str, arguments: dict, result) -> dict:
+    """Resolves what a tool call actually did into a plain, JSON-safe
+    fact — only Python has DB access, so this is as far as Python goes.
+    Wording/language of the eventual reply is entirely the LLM's job
+    (grocery_agent.llm.generate_reply), not decided here."""
+    if tool_name in ("add_item", "consume_item", "add_to_shopping_list"):
+        fact = {"action": tool_name, **arguments}
+        for date_field in ("purchase_date", "expiry_date"):
+            if isinstance(fact.get(date_field), date_cls):
+                fact[date_field] = fact[date_field].isoformat()
+        return fact
     if tool_name == "query_stock":
-        if not result:
-            name = arguments.get("name")
-            return f"你没有 {name} 了。" if name else "库存中没有东西。"
-        return "\n".join(_item_line(r["name"], r["quantity"]) for r in result)
-    if tool_name == "query_batch_details":
-        name = arguments["name"]
-        if not result:
-            return f"你没有 {name} 了。"
-        lines = []
-        for b in result:
-            line = f"{_item_line(name, b['quantity'])}，购买于 {b['purchase_date']}"
-            if b["expiry_date"]:
-                line += f"，保质期至 {b['expiry_date']}"
-            lines.append(line)
-        return "\n".join(lines)
+        return {"action": tool_name, "requested_name": arguments.get("name"), "items": result}
+    if tool_name == "query_item_details":
+        return {
+            "action": tool_name,
+            "name": arguments["name"],
+            "items": [
+                {
+                    "quantity": r["quantity"],
+                    "purchase_date": str(r["purchase_date"]),
+                    "expiry_date": str(r["expiry_date"]) if r["expiry_date"] else None,
+                }
+                for r in result
+            ],
+        }
     if tool_name == "query_shopping_list":
-        if not result:
-            return "购物清单是空的。"
         inventory_repo = InventoryRepository(conn)
-        names = [inventory_repo.get_item(e.item_id).name for e in result]
-        return "购物清单：\n" + "\n".join(names)
+        names = [inventory_repo.get_product(e.product_id).name for e in result]
+        return {"action": tool_name, "items": names}
     if tool_name == "query_expiring_soon":
-        if not result:
-            return "没有快过期的东西。"
-        return "即将过期：\n" + "\n".join(r["name"] for r in result)
-    return "完成。"
+        return {
+            "action": tool_name,
+            "items": [
+                {"name": r["name"], "quantity": r["quantity"], "expiry_date": str(r["expiry_date"])}
+                for r in result
+            ],
+        }
+    return {"action": tool_name}
 
 
 def _run_custom_action(conn, household_id: str, user_id: str, description: str) -> str:
-    """The Stage-8 fallback: no predefined tool fit, so generate code
-    against the safe /internal/sandbox primitives and run it in an
-    isolated Modal Sandbox — never in our own process, never with DB
-    credentials. Logged to ActionLog like every other action, and the
-    generated code is included so it's inspectable after the fact."""
+    """The sandboxed code-execution fallback: no predefined tool fit, so
+    generate code against the safe /internal/sandbox primitives and run
+    it in an isolated Modal Sandbox — never in our own process, never
+    with DB credentials. Logged to ActionLog like every other action,
+    and the generated code is included so it's inspectable after the
+    fact."""
     code = sandbox.generate_code(description)
     sandbox.validate_generated_code(code)
     token = sandbox.issue_sandbox_token(household_id, user_id)
@@ -228,14 +172,19 @@ def _run_custom_action(conn, household_id: str, user_id: str, description: str) 
     return result
 
 
-def _execute_calls(conn, household_id: str, user_id: str, calls: list) -> str:
+def _execute_calls(conn, household_id: str, user_id: str, context: str | None, calls: list) -> str:
     """Runs a list of ToolCalls (from text parsing or receipt parsing)
     and commits once, atomically, at the end. Shared by _process_utterance
-    and the receipt-photo path."""
-    lines = []
+    and the receipt-photo path. `context` is the original request text
+    (None for a receipt photo) — passed through so the reply can mirror
+    its language."""
+    facts = []
+    custom_action_texts = []
     for call in calls:
         if call.tool_name == "custom_action":
-            lines.append(
+            # Already a finished, LLM-authored message (from the sandbox
+            # codegen's own `return` statement) — not re-summarized.
+            custom_action_texts.append(
                 _run_custom_action(conn, household_id, user_id, call.arguments["description"])
             )
             continue
@@ -245,7 +194,7 @@ def _execute_calls(conn, household_id: str, user_id: str, calls: list) -> str:
             result = tool_fn(conn, household_id, user_id, **arguments)
         else:
             result = tool_fn(conn, household_id, **arguments)
-        lines.append(_format_response(conn, call.tool_name, arguments, result))
+        facts.append(_call_to_fact(conn, call.tool_name, arguments, result))
     conn.commit()
 
     try:
@@ -255,11 +204,13 @@ def _execute_calls(conn, household_id: str, user_id: str, calls: list) -> str:
     except Exception:
         conn.rollback()
 
-    return "\n".join(lines)
+    parts = [generate_reply(context, facts)] if facts else []
+    parts.extend(custom_action_texts)
+    return "\n".join(parts)
 
 
 def _process_utterance(conn, household_id: str, user_id: str, text: str) -> str:
-    """Shared pipeline for a typed Telegram message: resolve a pending
+    """Shared pipeline for a typed message: resolve a pending
     clarification if one's outstanding, parse, then dispatch via
     _execute_calls. Returns the response text."""
     pending = _pending_clarifications.get(user_id)
@@ -288,14 +239,14 @@ def _process_utterance(conn, household_id: str, user_id: str, text: str) -> str:
         return parsed.clarification
 
     _pending_clarifications.pop(user_id, None)
-    response_text = _execute_calls(conn, household_id, user_id, parsed.calls)
+    response_text = _execute_calls(conn, household_id, user_id, text, parsed.calls)
     _notify_telegram_confirmation(conn, household_id, response_text)
     return response_text
 
 
 @app.post("/utterance")
 def post_utterance(
-    payload: UtteranceRequest, user: AuthenticatedUser = Depends(verify_supabase_token)
+    payload: UtteranceRequest, household_id: str = Depends(verify_api_token)
 ):
     text = payload.text.strip()
     if not text:
@@ -303,8 +254,7 @@ def post_utterance(
 
     conn = get_connection()
     try:
-        household_id = _get_household_id(conn, user.id)
-        response_text = _process_utterance(conn, household_id, user.id, text)
+        response_text = _process_utterance(conn, household_id, "api-test", text)
         return {"response": response_text}
     except Exception:
         conn.rollback()
@@ -316,9 +266,8 @@ def post_utterance(
 @app.post("/telegram-webhook")
 def telegram_webhook(update: dict, request: Request):
     """The primary front end: type a message, or send a receipt photo,
-    directly in the household's Telegram group — routed by chat id,
-    not a bearer token. Registered with Telegram via
-    scripts/set_telegram_webhook.py."""
+    directly in the household's Telegram group — routed by chat id.
+    Registered with Telegram via scripts/set_telegram_webhook.py."""
     expected_secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
     if expected_secret and request.headers.get(
         "x-telegram-bot-api-secret-token"
@@ -330,12 +279,16 @@ def telegram_webhook(update: dict, request: Request):
     if message is None or chat_id is None:
         return {"ok": True}  # nothing actionable; ack and ignore
 
+    sender = message.get("from") or {}
+    user_id = str(sender.get("id", "unknown"))
+    if sender.get("first_name"):
+        user_id = f"{sender['first_name']} ({user_id})"
+
     conn = get_connection()
     try:
         household = HouseholdRepository(conn).get_by_telegram_chat_id(chat_id)
-        if household is None or not household.member_ids:
+        if household is None:
             return {"ok": True}  # unrecognized chat; ack and ignore
-        user_id = household.member_ids[0]
 
         photos = message.get("photo")
         text = message.get("text")
@@ -343,9 +296,9 @@ def telegram_webhook(update: dict, request: Request):
             image_bytes = download_telegram_file(photos[-1]["file_id"])  # largest is last
             calls = receipt.parse_receipt(image_bytes)
             response_text = (
-                _execute_calls(conn, household.id, user_id, calls)
+                _execute_calls(conn, household.id, user_id, None, calls)
                 if calls
-                else "没有从图片中识别出任何商品。"
+                else generate_reply(None, [{"action": "no_items_found_in_photo"}])
             )
             _notify_telegram_confirmation(conn, household.id, response_text)
         elif text:
@@ -358,7 +311,7 @@ def telegram_webhook(update: dict, request: Request):
         conn.close()
 
 
-# --- Internal sandbox API (Stage 8) -----------------------------------
+# --- Internal sandbox API -----------------------------------------------
 #
 # Called only by code running inside a Modal Sandbox (see
 # grocery_agent/sandbox.py) via a short-lived, single-use token — never
@@ -384,7 +337,7 @@ class SandboxGetStockRequest(BaseModel):
 class SandboxAddItemRequest(BaseModel):
     name: str
     quantity: float
-    unit: str = "unit"
+    purchase_date: str | None = None
     expiry_date: str | None = None
 
 
@@ -418,9 +371,13 @@ def sandbox_add_item(
 ):
     conn = get_connection()
     try:
+        purchase_date = (
+            date_cls.fromisoformat(payload.purchase_date) if payload.purchase_date else None
+        )
         expiry_date = date_cls.fromisoformat(payload.expiry_date) if payload.expiry_date else None
         tools.add_item(
-            conn, scope.household_id, scope.user_id, payload.name, payload.quantity, payload.unit, expiry_date
+            conn, scope.household_id, scope.user_id, payload.name, payload.quantity,
+            purchase_date, expiry_date,
         )
         conn.commit()
         return {"ok": True}
@@ -471,7 +428,7 @@ def sandbox_get_shopping_list(
     try:
         entries = tools.query_shopping_list(conn, scope.household_id)
         inventory_repo = InventoryRepository(conn)
-        return {"items": [inventory_repo.get_item(e.item_id).name for e in entries]}
+        return {"items": [inventory_repo.get_product(e.product_id).name for e in entries]}
     finally:
         conn.close()
 

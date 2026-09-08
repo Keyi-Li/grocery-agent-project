@@ -1,7 +1,7 @@
-"""Stage 3 persistence layer — repository classes wrapping Postgres.
+"""Persistence layer — repository classes wrapping Postgres.
 
-Translate between Stage-1 domain objects (grocery_agent.dataclass) and
-DB rows. See docs/grocery-agent-plan.md Section 3 and Stage 3.
+Translates between domain objects (grocery_agent.dataclass) and DB
+rows.
 """
 
 from __future__ import annotations
@@ -12,25 +12,7 @@ from datetime import datetime, timezone
 import psycopg
 from psycopg.types.json import Json
 
-from grocery_agent.dataclass import Batch, Household, Item, ShoppingListEntry, User
-
-
-class UserRepository:
-    def __init__(self, conn: psycopg.Connection):
-        self._conn = conn
-
-    def create(self, user: User) -> None:
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO users (id, email) VALUES (%s, %s)",
-                (user.id, user.email),
-            )
-
-    def get(self, user_id: str) -> User | None:
-        with self._conn.cursor() as cur:
-            cur.execute("SELECT id, email FROM users WHERE id = %s", (user_id,))
-            row = cur.fetchone()
-        return User(id=row[0], email=row[1]) if row else None
+from grocery_agent.dataclass import Household, Item, Product, ShoppingListEntry
 
 
 class HouseholdRepository:
@@ -44,12 +26,6 @@ class HouseholdRepository:
                 "VALUES (%s, %s, %s)",
                 (household.id, household.name, household.telegram_chat_id),
             )
-            for user_id in household.member_ids:
-                cur.execute(
-                    "INSERT INTO household_members (household_id, user_id) "
-                    "VALUES (%s, %s)",
-                    (household.id, user_id),
-                )
 
     def get(self, household_id: str) -> Household | None:
         with self._conn.cursor() as cur:
@@ -58,139 +34,118 @@ class HouseholdRepository:
                 (household_id,),
             )
             row = cur.fetchone()
-            if row is None:
-                return None
-            cur.execute(
-                "SELECT user_id FROM household_members WHERE household_id = %s",
-                (household_id,),
-            )
-            member_ids = [r[0] for r in cur.fetchall()]
-        return Household(
-            id=row[0], name=row[1], telegram_chat_id=row[2], member_ids=member_ids
-        )
-
-    def add_member(self, household_id: str, user_id: str) -> None:
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO household_members (household_id, user_id) "
-                "VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                (household_id, user_id),
-            )
-
-    def set_telegram_chat_id(self, household_id: str, chat_id: str) -> None:
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "UPDATE households SET telegram_chat_id = %s WHERE id = %s",
-                (chat_id, household_id),
-            )
+        return Household(id=row[0], name=row[1], telegram_chat_id=row[2]) if row else None
 
     def get_by_telegram_chat_id(self, chat_id: str) -> Household | None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT id FROM households WHERE telegram_chat_id = %s", (str(chat_id),)
+                "SELECT id, name, telegram_chat_id FROM households WHERE telegram_chat_id = %s",
+                (str(chat_id),),
             )
             row = cur.fetchone()
-        return self.get(row[0]) if row else None
+        return Household(id=row[0], name=row[1], telegram_chat_id=row[2]) if row else None
 
 
 class InventoryRepository:
-    """Wraps both `items` (the global canonical catalog) and `batches`
+    """Wraps both `products` (the global canonical catalog) and `items`
     (per-household stock) — used together for every stock operation."""
 
     def __init__(self, conn: psycopg.Connection):
         self._conn = conn
 
-    def get_or_create_item(self, name: str, stale_after_days: int = 5) -> Item:
+    def get_or_create_product(self, name: str) -> Product:
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, name, stale_after_days FROM items WHERE name = %s",
-                (name,),
-            )
+            cur.execute("SELECT id, name FROM products WHERE name = %s", (name,))
             row = cur.fetchone()
             if row is not None:
-                return Item(id=row[0], name=row[1], stale_after_days=row[2])
-            item = Item(name=name, stale_after_days=stale_after_days)
+                return Product(id=row[0], name=row[1])
+            product = Product(name=name)
             cur.execute(
-                "INSERT INTO items (id, name, stale_after_days) VALUES (%s, %s, %s)",
-                (item.id, item.name, item.stale_after_days),
+                "INSERT INTO products (id, name) VALUES (%s, %s)",
+                (product.id, product.name),
             )
-        return item
+        return product
 
-    def get_item(self, item_id: str) -> Item | None:
+    def get_product(self, product_id: str) -> Product | None:
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, name, stale_after_days FROM items WHERE id = %s",
-                (item_id,),
-            )
+            cur.execute("SELECT id, name FROM products WHERE id = %s", (product_id,))
             row = cur.fetchone()
-        return Item(id=row[0], name=row[1], stale_after_days=row[2]) if row else None
+        return Product(id=row[0], name=row[1]) if row else None
 
-    def add_batch(self, batch: Batch) -> None:
+    def add_item(self, item: Item) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO batches (id, household_id, item_id, quantity, unit, "
-                "purchase_date, expiry_date) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                "INSERT INTO items (id, household_id, product_id, quantity, "
+                "purchase_date, expiry_date, stale_after_days) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (
-                    batch.id,
-                    batch.household_id,
-                    batch.item_id,
-                    batch.quantity,
-                    batch.unit,
-                    batch.purchase_date,
-                    batch.expiry_date,
+                    item.id,
+                    item.household_id,
+                    item.product_id,
+                    item.quantity,
+                    item.purchase_date,
+                    item.expiry_date,
+                    item.stale_after_days,
                 ),
             )
 
-    def get_batches(
-        self, household_id: str, item_id: str | None = None
-    ) -> list[Batch]:
+    def get_items(
+        self, household_id: str, product_id: str | None = None
+    ) -> list[Item]:
         query = (
-            "SELECT id, household_id, item_id, quantity, unit, purchase_date, "
-            "expiry_date FROM batches WHERE household_id = %s"
+            "SELECT id, household_id, product_id, quantity, purchase_date, "
+            "expiry_date, stale_after_days FROM items WHERE household_id = %s"
         )
         params: list[str] = [household_id]
-        if item_id is not None:
-            query += " AND item_id = %s"
-            params.append(item_id)
+        if product_id is not None:
+            query += " AND product_id = %s"
+            params.append(product_id)
         query += " ORDER BY expiry_date NULLS LAST"
         with self._conn.cursor() as cur:
             cur.execute(query, params)
             rows = cur.fetchall()
         return [
-            Batch(
+            Item(
                 id=r[0],
                 household_id=r[1],
-                item_id=r[2],
+                product_id=r[2],
                 quantity=r[3],
-                unit=r[4],
-                purchase_date=r[5],
-                expiry_date=r[6],
+                purchase_date=r[4],
+                expiry_date=r[5],
+                stale_after_days=r[6],
             )
             for r in rows
         ]
 
-    def save_batch_quantity(self, batch: Batch) -> None:
-        """Persist a batch's current in-memory quantity (e.g. after
-        services.consume_from_batches mutated it) back to its row."""
+    def save_item_quantity(self, item: Item) -> None:
+        """Persist an item's current in-memory quantity (e.g. after
+        services.consume_from_items mutated it) back to its row."""
         with self._conn.cursor() as cur:
             cur.execute(
-                "UPDATE batches SET quantity = %s WHERE id = %s",
-                (batch.quantity, batch.id),
+                "UPDATE items SET quantity = %s WHERE id = %s",
+                (item.quantity, item.id),
             )
 
-    def get_all_items_for_household(self, household_id: str) -> list[Item]:
-        """Every item that has at least one batch (of any quantity) in
+    def delete_item(self, item_id: str) -> None:
+        """Removes a fully-consumed item row outright rather than leaving
+        a zero-quantity one around. reminder_state rows tied to it
+        cascade-delete automatically (FK ON DELETE CASCADE)."""
+        with self._conn.cursor() as cur:
+            cur.execute("DELETE FROM items WHERE id = %s", (item_id,))
+
+    def get_all_products_for_household(self, household_id: str) -> list[Product]:
+        """Every product that has at least one item (of any quantity) in
         this household — used by tool functions to enumerate stock
-        without the caller naming an item."""
+        without the caller naming a product."""
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT DISTINCT items.id, items.name, items.stale_after_days "
-                "FROM items JOIN batches ON batches.item_id = items.id "
-                "WHERE batches.household_id = %s",
+                "SELECT DISTINCT products.id, products.name "
+                "FROM products JOIN items ON items.product_id = products.id "
+                "WHERE items.household_id = %s",
                 (household_id,),
             )
             rows = cur.fetchall()
-        return [Item(id=r[0], name=r[1], stale_after_days=r[2]) for r in rows]
+        return [Product(id=r[0], name=r[1]) for r in rows]
 
 
 class ShoppingListRepository:
@@ -200,30 +155,22 @@ class ShoppingListRepository:
     def get_entries(self, household_id: str) -> list[ShoppingListEntry]:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT id, household_id, item_id, source, created_at "
+                "SELECT id, household_id, product_id, source "
                 "FROM shopping_list_entries WHERE household_id = %s",
                 (household_id,),
             )
             rows = cur.fetchall()
         return [
-            ShoppingListEntry(
-                id=r[0], household_id=r[1], item_id=r[2], source=r[3], created_at=r[4]
-            )
+            ShoppingListEntry(id=r[0], household_id=r[1], product_id=r[2], source=r[3])
             for r in rows
         ]
 
     def add_entry(self, entry: ShoppingListEntry) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO shopping_list_entries (id, household_id, item_id, "
-                "source, created_at) VALUES (%s, %s, %s, %s, %s)",
-                (
-                    entry.id,
-                    entry.household_id,
-                    entry.item_id,
-                    entry.source,
-                    entry.created_at,
-                ),
+                "INSERT INTO shopping_list_entries (id, household_id, product_id, "
+                "source) VALUES (%s, %s, %s, %s)",
+                (entry.id, entry.household_id, entry.product_id, entry.source),
             )
 
     def remove_entry(self, entry_id: str) -> None:
@@ -234,40 +181,40 @@ class ShoppingListRepository:
 
 
 class ReminderStateRepository:
-    """Tracks whether a reminder has already fired for a batch (plan
-    Section 3b) — one-time for expiry, repeating for staleness."""
+    """Tracks whether a reminder has already fired for an item —
+    one-time for expiry, repeating for staleness."""
 
     def __init__(self, conn: psycopg.Connection):
         self._conn = conn
 
-    def get(self, batch_id: str, reminder_type: str) -> dict | None:
+    def get(self, item_id: str, reminder_type: str) -> dict | None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT id, batch_id, reminder_type, last_sent_at, active "
-                "FROM reminder_state WHERE batch_id = %s AND reminder_type = %s",
-                (batch_id, reminder_type),
+                "SELECT id, item_id, reminder_type, last_sent_at, active "
+                "FROM reminder_state WHERE item_id = %s AND reminder_type = %s",
+                (item_id, reminder_type),
             )
             row = cur.fetchone()
         if row is None:
             return None
         return {
             "id": row[0],
-            "batch_id": row[1],
+            "item_id": row[1],
             "reminder_type": row[2],
             "last_sent_at": row[3],
             "active": row[4],
         }
 
     def upsert(
-        self, batch_id: str, reminder_type: str, last_sent_at: datetime, active: bool = True
+        self, item_id: str, reminder_type: str, last_sent_at: datetime, active: bool = True
     ) -> None:
-        existing = self.get(batch_id, reminder_type)
+        existing = self.get(item_id, reminder_type)
         with self._conn.cursor() as cur:
             if existing is None:
                 cur.execute(
-                    "INSERT INTO reminder_state (id, batch_id, reminder_type, "
+                    "INSERT INTO reminder_state (id, item_id, reminder_type, "
                     "last_sent_at, active) VALUES (%s, %s, %s, %s, %s)",
-                    (str(uuid.uuid4()), batch_id, reminder_type, last_sent_at, active),
+                    (str(uuid.uuid4()), item_id, reminder_type, last_sent_at, active),
                 )
             else:
                 cur.execute(
@@ -276,17 +223,11 @@ class ReminderStateRepository:
                     (last_sent_at, active, existing["id"]),
                 )
 
-    def deactivate_for_batch(self, batch_id: str) -> None:
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "UPDATE reminder_state SET active = false WHERE batch_id = %s",
-                (batch_id,),
-            )
-
 
 class ActionLogRepository:
-    """Append-only audit trail (plan Section 3d) — written by every
-    Stage 4 tool function, never read back by the agent itself."""
+    """Append-only audit trail. `user_id` is a plain label (the
+    Telegram sender's id/name), not a foreign key — there's no users
+    table to reference."""
 
     def __init__(self, conn: psycopg.Connection):
         self._conn = conn

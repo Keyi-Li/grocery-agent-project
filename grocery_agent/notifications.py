@@ -1,8 +1,7 @@
-"""Stage 7 — Telegram delivery (plan Section 3c).
+"""Telegram delivery.
 
 One bot token (global secret in .env), one chat id per household
-(Household.telegram_chat_id) — see docs/grocery-agent-plan.md
-Section 3c for the setup steps.
+(Household.telegram_chat_id).
 """
 
 from __future__ import annotations

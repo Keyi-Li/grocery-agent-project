@@ -1,4 +1,4 @@
-"""Tests for Stage 8 sandboxed code-execution fallback.
+"""Tests for the sandboxed code-execution fallback.
 
 The real Modal sandbox mechanics are tested directly (test_run_in_sandbox_*)
 since that's cheap and fast; the full network round-trip from inside a
@@ -14,14 +14,10 @@ from fastapi.testclient import TestClient
 
 import grocery_agent.api as api_module
 import grocery_agent.sandbox as sandbox_module
-from grocery_agent.dataclass import Household, User
+from grocery_agent.dataclass import Household
 from grocery_agent.db import get_connection
 from grocery_agent.llm import ParsedCommand, ToolCall
-from grocery_agent.repositories import (
-    ActionLogRepository,
-    HouseholdRepository,
-    UserRepository,
-)
+from grocery_agent.repositories import ActionLogRepository, HouseholdRepository
 from grocery_agent.sandbox import (
     generate_code,
     issue_sandbox_token,
@@ -30,6 +26,8 @@ from grocery_agent.sandbox import (
     run_in_sandbox,
     validate_generated_code,
 )
+
+USER_ID = "test-user"
 
 
 # --- validate_generated_code ------------------------------------------
@@ -97,29 +95,25 @@ def test_generate_code_produces_valid_run_function():
 
 
 @pytest.fixture
-def household_and_user(db_conn):
-    user = User(email="sandbox-test@example.com")
-    UserRepository(db_conn).create(user)
-    household = Household(name="Sandbox Test Household", member_ids=[user.id])
+def household(db_conn):
+    household = Household(name="Sandbox Test Household")
     HouseholdRepository(db_conn).create(household)
     db_conn.commit()
     try:
-        yield household, user
+        yield household
     finally:
         cleanup_conn = get_connection()
         try:
             with cleanup_conn.cursor() as cur:
                 cur.execute("DELETE FROM households WHERE id = %s", (household.id,))
-                cur.execute("DELETE FROM users WHERE id = %s", (user.id,))
             cleanup_conn.commit()
         finally:
             cleanup_conn.close()
 
 
 @pytest.fixture
-def sandbox_client(household_and_user):
-    household, user = household_and_user
-    token = issue_sandbox_token(household.id, user.id)
+def sandbox_client(household):
+    token = issue_sandbox_token(household.id, USER_ID)
     try:
         with TestClient(api_module.app) as client:
             client.headers.update({"Authorization": f"Bearer {token}"})
@@ -134,22 +128,26 @@ def test_sandbox_endpoints_require_valid_token():
     assert response.status_code == 401
 
 
-def test_sandbox_add_and_get_stock(sandbox_client, household_and_user):
-    household, _user = household_and_user
-
+def test_sandbox_add_and_get_stock(sandbox_client):
     add_response = sandbox_client.post(
-        "/internal/sandbox/add_item", json={"name": "sandbox-apple", "quantity": 3, "unit": "unit"}
+        "/internal/sandbox/add_item", json={"name": "sandbox-apple", "quantity": 3}
     )
     assert add_response.json() == {"ok": True}
 
     stock_response = sandbox_client.post("/internal/sandbox/get_stock", json={})
-    assert {"name": "sandbox-apple", "quantity": 3, "unit": "unit"} in stock_response.json()["items"]
+    assert {"name": "sandbox-apple", "quantity": 3} in stock_response.json()["items"]
+
+
+def test_sandbox_add_item_with_purchase_date(sandbox_client):
+    add_response = sandbox_client.post(
+        "/internal/sandbox/add_item",
+        json={"name": "sandbox-rice", "quantity": 1, "purchase_date": "2026-01-01"},
+    )
+    assert add_response.json() == {"ok": True}
 
 
 def test_sandbox_consume_item(sandbox_client):
-    sandbox_client.post(
-        "/internal/sandbox/add_item", json={"name": "sandbox-egg", "quantity": 5, "unit": "unit"}
-    )
+    sandbox_client.post("/internal/sandbox/add_item", json={"name": "sandbox-egg", "quantity": 5})
     consume_response = sandbox_client.post(
         "/internal/sandbox/consume_item", json={"name": "sandbox-egg", "quantity": 2}
     )
@@ -158,7 +156,7 @@ def test_sandbox_consume_item(sandbox_client):
     stock = sandbox_client.post(
         "/internal/sandbox/get_stock", json={"name": "sandbox-egg"}
     ).json()["items"]
-    assert stock == [{"name": "sandbox-egg", "quantity": 3, "unit": "unit"}]
+    assert stock == [{"name": "sandbox-egg", "quantity": 3}]
 
 
 def test_sandbox_add_to_shopping_list_and_get_it(sandbox_client):
@@ -176,9 +174,7 @@ def test_sandbox_get_expiring_soon_empty(sandbox_client):
 
 
 def test_run_custom_action_logs_and_returns_sandbox_result(db_conn, monkeypatch):
-    user = User(email="custom-action-test@example.com")
-    UserRepository(db_conn).create(user)
-    household = Household(name="Custom Action Household", member_ids=[user.id])
+    household = Household(name="Custom Action Household")
     HouseholdRepository(db_conn).create(household)
     db_conn.commit()
 
@@ -190,7 +186,7 @@ def test_run_custom_action_logs_and_returns_sandbox_result(db_conn, monkeypatch)
             sandbox_module, "run_in_sandbox", lambda code, base_url, token, timeout=60: "库存已清空"
         )
 
-        result = api_module._run_custom_action(db_conn, household.id, user.id, "清空库存")
+        result = api_module._run_custom_action(db_conn, household.id, USER_ID, "清空库存")
         db_conn.commit()  # _run_custom_action doesn't commit itself (api.py's
         # caller does, after all calls in an utterance finish) — without this,
         # the uncommitted ActionLog insert's FK lock on `households` blocks
@@ -205,27 +201,19 @@ def test_run_custom_action_logs_and_returns_sandbox_result(db_conn, monkeypatch)
         try:
             with cleanup_conn.cursor() as cur:
                 cur.execute("DELETE FROM households WHERE id = %s", (household.id,))
-                cur.execute("DELETE FROM users WHERE id = %s", (user.id,))
             cleanup_conn.commit()
         finally:
             cleanup_conn.close()
 
 
 def test_custom_action_dispatched_from_utterance(monkeypatch):
-    from grocery_agent.dataclass import Household, User
-    from grocery_agent.repositories import HouseholdRepository, UserRepository
-
     conn = get_connection()
-    user = User(email="dispatch-test@example.com")
-    UserRepository(conn).create(user)
-    household = Household(name="Dispatch Test Household", member_ids=[user.id])
+    household = Household(name="Dispatch Test Household")
     HouseholdRepository(conn).create(household)
     conn.commit()
 
     try:
-        api_module.app.dependency_overrides[api_module.verify_supabase_token] = (
-            lambda: api_module.AuthenticatedUser(id=user.id, email=user.email)
-        )
+        api_module.app.dependency_overrides[api_module.verify_api_token] = lambda: household.id
         api_module._pending_clarifications.clear()
         monkeypatch.setattr(
             api_module,
@@ -249,6 +237,5 @@ def test_custom_action_dispatched_from_utterance(monkeypatch):
         api_module._pending_clarifications.clear()
         with conn.cursor() as cur:
             cur.execute("DELETE FROM households WHERE id = %s", (household.id,))
-            cur.execute("DELETE FROM users WHERE id = %s", (user.id,))
         conn.commit()
         conn.close()

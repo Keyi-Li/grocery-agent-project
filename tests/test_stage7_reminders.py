@@ -1,11 +1,8 @@
-"""Tests for Stage 7 notifications + reminder checking.
+"""Tests for notifications + reminder checking.
 
 send_telegram_message's actual HTTP call is monkeypatched (we don't
 have a real Telegram group chat id to deliver to in CI) — everything
 else (DB, ReminderState tracking, is_expiring_soon/is_stale) is real.
-The plan explicitly calls the final live-delivery check a manual test
-(Stage 7), so that part is left for you to verify by hand once a
-household has a real telegram_chat_id.
 """
 
 from datetime import date, datetime, timedelta, timezone
@@ -14,27 +11,33 @@ import pytest
 
 import grocery_agent.notifications as notifications_module
 import grocery_agent.reminders as reminders_module
-from grocery_agent.dataclass import Batch, Household, User
+from grocery_agent.dataclass import Household, Item
 from grocery_agent.reminders import run_reminder_check
 from grocery_agent.repositories import (
     HouseholdRepository,
     InventoryRepository,
     ReminderStateRepository,
-    UserRepository,
 )
+
+USER_ID = "test-user"
+
+
+@pytest.fixture(autouse=True)
+def mock_generate_reply(monkeypatch):
+    # generate_reply is itself LLM-backed (live-tested in
+    # test_stage5_llm.py) — deterministic here so reminder-logic
+    # assertions (which fact fired, how many times) aren't at the
+    # mercy of the model's exact wording.
+    monkeypatch.setattr(
+        reminders_module, "generate_reply", lambda context, facts: f"{facts[0]['name']}: {facts[0]['action']}"
+    )
 
 
 @pytest.fixture
 def household_with_telegram(db_conn):
-    user = User(email="reminders-test@example.com")
-    UserRepository(db_conn).create(user)
-    household = Household(
-        name="Reminders Test Household",
-        member_ids=[user.id],
-        telegram_chat_id="-100999",
-    )
+    household = Household(name="Reminders Test Household", telegram_chat_id="-100999")
     HouseholdRepository(db_conn).create(household)
-    return household, user
+    return household
 
 
 @pytest.fixture
@@ -70,21 +73,19 @@ def test_send_telegram_message_posts_to_bot_api(monkeypatch):
 
 
 def test_no_reminders_when_household_has_no_telegram_chat_id(db_conn, sent_messages):
-    user = User(email="no-telegram@example.com")
-    UserRepository(db_conn).create(user)
-    household = Household(name="No Telegram Household", member_ids=[user.id])
+    household = Household(name="No Telegram Household")
     HouseholdRepository(db_conn).create(household)
 
     inventory_repo = InventoryRepository(db_conn)
-    item = inventory_repo.get_or_create_item("yogurt")
-    batch = Batch(
+    product = inventory_repo.get_or_create_product("yogurt")
+    item = Item(
         household_id=household.id,
-        item_id=item.id,
+        product_id=product.id,
         quantity=1,
         purchase_date=date.today(),
         expiry_date=date.today() + timedelta(days=1),
     )
-    inventory_repo.add_batch(batch)
+    inventory_repo.add_item(item)
 
     result = run_reminder_check(db_conn, household.id)
 
@@ -93,17 +94,17 @@ def test_no_reminders_when_household_has_no_telegram_chat_id(db_conn, sent_messa
 
 
 def test_expiry_reminder_fires_once(db_conn, household_with_telegram, sent_messages):
-    household, _user = household_with_telegram
+    household = household_with_telegram
     inventory_repo = InventoryRepository(db_conn)
-    item = inventory_repo.get_or_create_item("yogurt")
-    batch = Batch(
+    product = inventory_repo.get_or_create_product("yogurt")
+    item = Item(
         household_id=household.id,
-        item_id=item.id,
+        product_id=product.id,
         quantity=1,
         purchase_date=date.today(),
         expiry_date=date.today() + timedelta(days=1),
     )
-    inventory_repo.add_batch(batch)
+    inventory_repo.add_item(item)
 
     first = run_reminder_check(db_conn, household.id)
     second = run_reminder_check(db_conn, household.id)
@@ -117,18 +118,17 @@ def test_expiry_reminder_fires_once(db_conn, household_with_telegram, sent_messa
 def test_staleness_reminder_repeats_after_interval(
     db_conn, household_with_telegram, sent_messages
 ):
-    household, _user = household_with_telegram
+    household = household_with_telegram
     inventory_repo = InventoryRepository(db_conn)
-    item = inventory_repo.get_or_create_item(
-        "canned beans"
-    )  # default stale_after_days=5
-    batch = Batch(
+    product = inventory_repo.get_or_create_product("canned beans")
+    item = Item(
         household_id=household.id,
-        item_id=item.id,
+        product_id=product.id,
         quantity=1,
         purchase_date=date.today() - timedelta(days=5),
+        stale_after_days=5,
     )
-    inventory_repo.add_batch(batch)
+    inventory_repo.add_item(item)
 
     first = run_reminder_check(db_conn, household.id)
     assert len(first) == 1
@@ -139,7 +139,7 @@ def test_staleness_reminder_repeats_after_interval(
     # Simulate the repeat interval having elapsed.
     reminder_repo = ReminderStateRepository(db_conn)
     reminder_repo.upsert(
-        batch.id,
+        item.id,
         "staleness",
         last_sent_at=datetime.now(timezone.utc) - timedelta(days=3),
     )
@@ -149,24 +149,28 @@ def test_staleness_reminder_repeats_after_interval(
     assert len(sent_messages) == 2
 
 
-def test_consuming_batch_to_zero_deactivates_its_reminder(
+def test_consuming_item_to_zero_deactivates_its_reminder(
     db_conn, household_with_telegram, sent_messages
 ):
     from grocery_agent.tools import consume_item
 
-    household, user = household_with_telegram
+    household = household_with_telegram
     inventory_repo = InventoryRepository(db_conn)
-    item = inventory_repo.get_or_create_item("canned beans")
-    batch = Batch(
+    product = inventory_repo.get_or_create_product("canned beans")
+    item = Item(
         household_id=household.id,
-        item_id=item.id,
+        product_id=product.id,
         quantity=1,
         purchase_date=date.today() - timedelta(days=5),
+        stale_after_days=5,
     )
-    inventory_repo.add_batch(batch)
+    inventory_repo.add_item(item)
 
     run_reminder_check(db_conn, household.id)  # fires staleness once
-    consume_item(db_conn, household.id, user.id, "canned beans", 1)
+    consume_item(db_conn, household.id, USER_ID, "canned beans", 1)
 
-    state = ReminderStateRepository(db_conn).get(batch.id, "staleness")
-    assert state["active"] is False
+    # The item row is deleted outright once fully consumed (not just
+    # zeroed), so its reminder_state row cascades away with it — there's
+    # nothing left to "deactivate."
+    state = ReminderStateRepository(db_conn).get(item.id, "staleness")
+    assert state is None

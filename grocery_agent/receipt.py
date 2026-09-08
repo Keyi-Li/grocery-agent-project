@@ -1,12 +1,11 @@
-"""Stage 9 — receipt photo parsing.
+"""Receipt photo parsing.
 
 A photo sent to the household's Telegram group is downloaded, sent to
 a vision-capable model via OpenRouter, and parsed into add_item tool
 calls — reusing the same canonicalization/language rule as the main
 text parser (grocery_agent.llm), since this is a separate LLM call
 with its own prompt and doesn't inherit that instruction automatically
-(see the Stage 8 note in docs/grocery-agent-plan.md about the same
-gap in the sandbox codegen prompt).
+(see the sandbox codegen prompt's own note about this same gap).
 """
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ import re
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from grocery_agent.dataclass import ALLOWED_UNITS
 from grocery_agent.llm import ToolCall
 
 load_dotenv()
@@ -28,12 +26,15 @@ DEFAULT_VISION_MODEL = "google/gemini-2.5-flash"
 
 _PROMPT = (
     "Read this grocery receipt image and extract every purchased line item as a "
-    "JSON array. Each element: {{\"name\": str, \"quantity\": number, \"unit\": str}}.\n\n"
-    "- unit must be one of: {units}\n"
+    'JSON array. Each element: {{"name": str, "quantity": number, '
+    '"purchase_date": str or null}}.\n\n'
     "- If the receipt shows a quantity or weight directly, use it.\n"
     "- If only a total price and a per-unit price are shown, derive "
     "quantity = total_price / unit_price.\n"
-    "- If no quantity is discernible at all, use 1 and unit \"unit\".\n"
+    "- If no quantity is discernible at all, use 1.\n"
+    "- purchase_date: the transaction date printed on the receipt, as an ISO date "
+    "(YYYY-MM-DD), if you can find one — otherwise null (it'll default to today, "
+    "which is wrong if this receipt is from an earlier day, so look carefully).\n"
     "- Normalize each name to one canonical {language} word, regardless of what "
     "language the receipt is printed in (e.g. \"milk\" and \"牛奶\" both become the "
     "same {language} word) — this must match how items are already named "
@@ -64,12 +65,7 @@ def parse_receipt(image_bytes: bytes, client: OpenAI | None = None) -> list[Tool
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {
-                "role": "system",
-                "content": _PROMPT.format(
-                    units=", ".join(sorted(ALLOWED_UNITS)), language=_language()
-                ),
-            },
+            {"role": "system", "content": _PROMPT.format(language=_language())},
             {
                 "role": "user",
                 "content": [
@@ -84,14 +80,10 @@ def parse_receipt(image_bytes: bytes, client: OpenAI | None = None) -> list[Tool
     text = re.sub(r"^```(?:json)?\n?|\n?```$", "", text).strip()
     items = json.loads(text)
 
-    return [
-        ToolCall(
-            tool_name="add_item",
-            arguments={
-                "name": item["name"],
-                "quantity": item["quantity"],
-                "unit": item.get("unit", "unit"),
-            },
-        )
-        for item in items
-    ]
+    calls = []
+    for item in items:
+        arguments = {"name": item["name"], "quantity": item["quantity"]}
+        if item.get("purchase_date"):
+            arguments["purchase_date"] = item["purchase_date"]
+        calls.append(ToolCall(tool_name="add_item", arguments=arguments))
+    return calls

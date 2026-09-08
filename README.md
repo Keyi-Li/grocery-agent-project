@@ -1,79 +1,121 @@
-# Grocery Tracker Agent — Claude Code Project Bundle
+# Grocery Agent
 
-## What's in this folder
+A Telegram-based grocery inventory tracker. Send it a message ("bought
+2 apples", "used the milk") or a photo of a receipt in your household's
+Telegram group, and it keeps track of what you have, what's expiring,
+and what you're running low on — parsing natural language (English or
+Chinese) via an LLM, no fixed command syntax.
 
+## How it works
+
+- **Telegram** is the only front end — one bot, one group chat per
+  household. Text and receipt photos both go through the same webhook.
+- **OpenRouter** provides the LLM: one call parses an utterance into
+  tool calls (add/consume/query), a second turns the result into a
+  reply in the same language as the request. Receipt photos go through
+  a vision-capable model instead.
+- **Postgres (via Supabase)** is the datastore — plain hosted Postgres,
+  no Supabase Auth; identity comes directly from Telegram.
+- **Modal** runs a sandboxed fallback for requests no predefined tool
+  covers (e.g. "clear all my stock"): a small generated Python script
+  runs in an isolated sandbox with no DB credentials, calling back into
+  a narrow internal API.
+- **Fly.io** hosts the FastAPI app.
+
+## Prerequisites
+
+- Python 3.11+
+- A [Supabase](https://supabase.com) project (free tier is fine)
+- A [Telegram bot](https://core.telegram.org/bots#botfather) token from `@BotFather`
+- An [OpenRouter](https://openrouter.ai/keys) API key
+- A [Modal](https://modal.com) account and API token
+- A [Fly.io](https://fly.io) account, for deployment
+
+## Setup
+
+1. **Install dependencies**
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Configure environment**
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   Fill in every value in `.env` — each one has a comment explaining
+   where to get it. `API_DEFAULT_HOUSEHOLD_ID` is filled in during step
+   4, so leave it blank for now.
+
+3. **Create the database schema**
+
+   Apply `grocery_agent/schema.sql` to your Supabase project (it's
+   idempotent — safe to re-run). Simplest way, via `psql`:
+
+   ```bash
+   psql "$DIRECT_URL" -f grocery_agent/schema.sql
+   ```
+
+4. **Create a household**
+
+   ```bash
+   python scripts/setup_household.py --household-name "The Lis"
+   ```
+
+   This prints a household id — put it in `.env` as
+   `API_DEFAULT_HOUSEHOLD_ID`.
+
+5. **Connect Telegram**
+
+   - Create your household's Telegram group and add the bot to it.
+   - Send any message in the group, then run:
+
+     ```bash
+     python scripts/get_telegram_chat_id.py
+     ```
+
+     to find its chat id.
+   - Save that chat id on the household row (re-run
+     `setup_household.py` with `--telegram-chat-id`, or update the row
+     directly).
+
+6. **Run it locally**
+
+   ```bash
+   uvicorn grocery_agent.api:app --reload --port 8080
+   ```
+
+   You can exercise the logic without Telegram via `POST /utterance`
+   (authenticated with `API_TOKEN` from `.env`):
+
+   ```bash
+   curl -X POST localhost:8080/utterance \
+     -H "Authorization: Bearer $API_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"text": "bought 2 apples"}'
+   ```
+
+## Deploying
+
+The app is set up to deploy to Fly.io (see `fly.toml`, `Dockerfile`).
+
+```bash
+fly launch   # first time only — or fly deploy if the app already exists
+fly secrets import < .env
+python scripts/set_telegram_webhook.py https://<your-app>.fly.dev
 ```
-grocery-agent-project/
-├── README.md                          ← you are here
-├── PROGRESS.md                        ← tracks which stage is done (Claude Code updates this)
-├── docs/
-│   └── grocery-agent-plan.md          ← the full design plan (what to build)
-└── .claude/
-    └── skills/
-        └── bottom-up-agent-build/
-            └── SKILL.md               ← the build process (how to build it)
+
+After that, messages sent in the household's Telegram group are
+delivered to `/telegram-webhook` on your deployed app.
+
+## Tests
+
+```bash
+pytest
 ```
 
-Claude Code automatically discovers skills placed under
-`.claude/skills/` in a project — you don't need to install or
-register anything. As long as you launch `claude` from inside this
-folder (or a parent of it), the skill will be available and should
-trigger automatically once you start talking about the plan/stages.
-
-## How to use this
-
-1. Copy this whole `grocery-agent-project/` folder to wherever you
-   want to develop (e.g. `~/dev/grocery-agent-project`).
-2. `cd` into it and run `claude` (or open it in Claude Code's
-   IDE/desktop integration).
-3. Use the kickoff prompt below as your first message.
-
-## Kickoff prompt (copy-paste this as your first message to Claude Code)
-
-```
-I want to build the grocery tracker agent described in
-docs/grocery-agent-plan.md, using the bottom-up-agent-build skill.
-
-My goal is to learn the standard process of building an AI agent, not
-just get working code — so please actually follow the skill's
-per-stage loop: implement one stage, write and run pytest tests for
-it, then stop and explain what you built and why, in plain terms, and
-wait for me to confirm I understand before moving to the next stage.
-
-Start by reading the plan and PROGRESS.md, then begin with Stage 1.
-```
-
-## What to expect
-
-- Claude Code will read the plan and `PROGRESS.md`, then work through
-  the stages **one at a time**, in the bottom-up order defined in the
-  plan (domain models → core logic → persistence → tool functions →
-  LLM parsing → API → Telegram integration). Note: the plan has since
-  evolved past its original Stage 1–7 scope — see `PROGRESS.md` for
-  what's actually been built (Telegram/receipt input replaced the
-  originally-planned Siri Shortcut, plus a sandboxed code-execution
-  fallback was added).
-- After each stage, it will run pytest and show you the results, then
-  explain what it built and why, then explicitly wait for you to say
-  you understand before continuing.
-- `PROGRESS.md` gets updated after each confirmed stage — so if you
-  close Claude Code and come back later (even in a new terminal
-  session), just say "continue the build" and it will pick up from
-  wherever `PROGRESS.md` says you left off.
-- If something in the plan turns out to be ambiguous or inconsistent
-  once actual code is being written (this is normal — plans are
-  written before code exists), Claude Code should flag it to you
-  rather than silently guessing.
-
-## If you want to adjust the process
-
-Edit `.claude/skills/bottom-up-agent-build/SKILL.md` directly — for
-example, if you decide you want two stages combined, or want the
-explanations shorter/longer, or want to skip the confirmation gate
-for later stages once you're comfortable. It's a plain markdown file.
-
-## If you want to adjust the design
-
-Edit `docs/grocery-agent-plan.md` directly, or ask Claude (in this
-chat or a fresh one) to help you revise it before feeding it back into
-Claude Code.
+Most tests run against the real Supabase project in `.env` (each test
+rolls back its own transaction) and the real OpenRouter API, so
+`.env` must be fully configured before running the suite.
