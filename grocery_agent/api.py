@@ -219,8 +219,13 @@ def _call_to_fact(conn, tool_name: str, arguments: dict, result) -> dict:
         }
     if tool_name == "query_shopping_list":
         inventory_repo = InventoryRepository(conn)
-        names = [inventory_repo.get_product(e.product_id).name for e in result]
-        return {"action": tool_name, "items": names}
+        manual_items = [
+            inventory_repo.get_product(e.product_id).name for e in result if e.source == "manual"
+        ]
+        auto_items = [
+            inventory_repo.get_product(e.product_id).name for e in result if e.source == "auto"
+        ]
+        return {"action": tool_name, "manual_items": manual_items, "auto_items": auto_items}
     if tool_name == "query_expiring_soon":
         return {
             "action": tool_name,

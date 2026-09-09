@@ -362,7 +362,14 @@ _REPLY_PROMPT = (
     "Expiring soon:\n"
     "milk 1, expires 2026-01-05\n\n"
     "Stale (unused for a while):\n"
-    "eggs 10, purchased 2026-01-01"
+    "eggs 10, purchased 2026-01-01\n\n"
+    "A query_shopping_list fact has manual_items and auto_items lists — "
+    "same two-section treatment (skip a section if empty), item names "
+    "only, comma-separated within a section, e.g.:\n"
+    "Shopping list:\n"
+    "hand soap, rice\n\n"
+    "Ran out automatically:\n"
+    "milk, eggs"
 )
 
 
