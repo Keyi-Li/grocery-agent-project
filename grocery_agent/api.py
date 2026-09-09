@@ -23,8 +23,15 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from grocery_agent import receipt, sandbox, tools
+from grocery_agent.dataclass import Household
 from grocery_agent.db import get_connection
-from grocery_agent.llm import ToolCall, generate_reply, is_affirmative, parse_utterance
+from grocery_agent.llm import (
+    ToolCall,
+    generate_reply,
+    is_affirmative,
+    parse_onboarding_reply,
+    parse_utterance,
+)
 from grocery_agent.notifications import download_telegram_file, send_telegram_message
 from grocery_agent.reminders import run_reminder_check_for_all_households
 from grocery_agent.repositories import (
@@ -36,6 +43,28 @@ from grocery_agent.repositories import (
 load_dotenv()
 
 app = FastAPI()
+
+# Self-service household onboarding: any message from an unrecognized chat
+# gets shown ONBOARDING_INSTRUCTIONS; a household is only created once a
+# reply contains MAGIC_WORD (checked deterministically, see
+# _contains_magic_word — never delegated to the LLM). Gates who can spin
+# up a household on this deployment without any manual setup.
+MAGIC_WORD = "20000520"
+
+ONBOARDING_INSTRUCTIONS = (
+    "New here? To set up this household, reply with the magic word (ask "
+    "whoever invited you), your household's name, and optionally a "
+    "timezone and a display language, in your own words. Timezone and "
+    "language default to America/New_York and English if left out."
+)
+
+
+def _contains_magic_word(text: str) -> bool:
+    """Plain substring check — the actual security gate for onboarding.
+    Never delegated to the LLM (see parse_onboarding_reply), and checked
+    before any LLM call is made at all, so a wrong/missing magic word
+    costs nothing and leaks no information about whether it was close."""
+    return MAGIC_WORD in text
 
 
 @app.get("/health")
@@ -263,7 +292,9 @@ def _run_generated_custom_action(
     return result
 
 
-def _run_custom_action(conn, household_id: str, user_id: str, description: str) -> str:
+def _run_custom_action(
+    conn, household_id: str, user_id: str, description: str, language: str
+) -> str:
     """The sandboxed code-execution fallback for a request with no
     predefined tool fit — generates and runs code immediately. Only
     reachable for code with no write effect (see
@@ -273,12 +304,14 @@ def _run_custom_action(conn, household_id: str, user_id: str, description: str) 
     the flat executor (_execute_calls, the receipt-photo path) — the
     interactive tool loop handles custom_action itself so it can gate
     on write effect before this ever runs."""
-    code = sandbox.generate_action_code(description)
+    code = sandbox.generate_action_code(description, language)
     sandbox.validate_generated_code(code)
     return _run_generated_custom_action(conn, household_id, user_id, description, code)
 
 
-def _dispatch_call(conn, household_id: str, user_id: str, call: ToolCall) -> tuple[dict, str | None]:
+def _dispatch_call(
+    conn, household_id: str, user_id: str, call: ToolCall, language: str
+) -> tuple[dict, str | None]:
     """Executes one ToolCall for real against the DB (or the sandbox, for
     custom_action). Returns (tool_result, custom_action_text):
     - tool_result is always a plain JSON-safe dict describing what
@@ -291,7 +324,7 @@ def _dispatch_call(conn, household_id: str, user_id: str, call: ToolCall) -> tup
       before — tool_result just wraps it for the conversation history.
     """
     if call.tool_name == "custom_action":
-        text = _run_custom_action(conn, household_id, user_id, call.arguments["description"])
+        text = _run_custom_action(conn, household_id, user_id, call.arguments["description"], language)
         return {"action": "custom_action", "result": text}, text
 
     arguments = _coerce_date_arguments(call.tool_name, call.arguments)
@@ -304,7 +337,12 @@ def _dispatch_call(conn, household_id: str, user_id: str, call: ToolCall) -> tup
 
 
 def _finalize(
-    conn, household_id: str, context: str | None, facts: list[dict], custom_action_texts: list[str]
+    conn,
+    household_id: str,
+    context: str | None,
+    facts: list[dict],
+    custom_action_texts: list[str],
+    language: str,
 ) -> str:
     """Commits everything a request did and produces the final reply
     text. Shared tail for both the flat executor (_execute_calls) and
@@ -312,12 +350,14 @@ def _finalize(
     checked here — that's decoupled from request handling entirely and
     runs on a schedule instead (see check_reminders)."""
     conn.commit()
-    parts = [generate_reply(context, facts)] if facts else []
+    parts = [generate_reply(context, facts, language)] if facts else []
     parts.extend(custom_action_texts)
     return "\n".join(parts)
 
 
-def _execute_calls(conn, household_id: str, user_id: str, context: str | None, calls: list) -> str:
+def _execute_calls(
+    conn, household_id: str, user_id: str, context: str | None, calls: list, language: str
+) -> str:
     """Runs a fixed, already-decided list of ToolCalls with no back-and-
     forth — used by the receipt-photo path, which has nothing to
     iterate on (the vision model already extracted the final list of
@@ -327,12 +367,12 @@ def _execute_calls(conn, household_id: str, user_id: str, context: str | None, c
     facts = []
     custom_action_texts = []
     for call in calls:
-        content, custom_text = _dispatch_call(conn, household_id, user_id, call)
+        content, custom_text = _dispatch_call(conn, household_id, user_id, call, language)
         if custom_text is not None:
             custom_action_texts.append(custom_text)
         else:
             facts.append(content)
-    return _finalize(conn, household_id, context, facts, custom_action_texts)
+    return _finalize(conn, household_id, context, facts, custom_action_texts, language)
 
 
 def _build_assistant_tool_calls_message(calls: list[ToolCall]) -> dict:
@@ -357,6 +397,7 @@ def _continue_tool_loop(
     messages: list[dict],
     facts: list[dict],
     custom_action_texts: list[str],
+    language: str,
     resumed: bool = False,
 ) -> str | PendingClarification | PendingCustomAction:
     """The actual loop body, factored out so both a fresh request
@@ -390,7 +431,7 @@ def _continue_tool_loop(
     context = messages[0]["content"]
 
     for iteration in range(MAX_TOOL_LOOP_ITERATIONS):
-        parsed = parse_utterance(messages)
+        parsed = parse_utterance(messages, language)
 
         if not parsed.calls:
             if iteration == 0 and not resumed and not facts and not custom_action_texts:
@@ -403,7 +444,7 @@ def _continue_tool_loop(
         for call in parsed.calls:
             if call.tool_name == "custom_action":
                 description = call.arguments["description"]
-                code = sandbox.generate_action_code(description)
+                code = sandbox.generate_action_code(description, language)
                 sandbox.validate_generated_code(code)
                 if sandbox.code_has_write_effect(code):
                     return PendingCustomAction(
@@ -419,7 +460,7 @@ def _continue_tool_loop(
                 custom_action_texts.append(text)
                 content = {"action": "custom_action", "result": text}
             else:
-                content, custom_text = _dispatch_call(conn, household_id, user_id, call)
+                content, custom_text = _dispatch_call(conn, household_id, user_id, call, language)
                 if custom_text is not None:
                     custom_action_texts.append(custom_text)
                 else:
@@ -432,17 +473,19 @@ def _continue_tool_loop(
                 }
             )
 
-    return _finalize(conn, household_id, context, facts, custom_action_texts)
+    return _finalize(conn, household_id, context, facts, custom_action_texts, language)
 
 
 def _run_tool_loop(
-    conn, household_id: str, user_id: str, messages: list[dict]
+    conn, household_id: str, user_id: str, messages: list[dict], language: str
 ) -> str | PendingClarification | PendingCustomAction:
-    return _continue_tool_loop(conn, household_id, user_id, messages, facts=[], custom_action_texts=[])
+    return _continue_tool_loop(
+        conn, household_id, user_id, messages, facts=[], custom_action_texts=[], language=language
+    )
 
 
 def _resume_custom_action(
-    conn, household_id: str, user_id: str, pending: PendingCustomAction, text: str
+    conn, household_id: str, user_id: str, pending: PendingCustomAction, text: str, language: str
 ) -> str | PendingClarification | PendingCustomAction:
     """Resolves a pending write-effecting custom_action: runs the exact
     already-generated code if the reply confirms it, otherwise records
@@ -474,17 +517,17 @@ def _resume_custom_action(
     messages.append({"role": "user", "content": text})
 
     return _continue_tool_loop(
-        conn, household_id, user_id, messages, facts, custom_action_texts, resumed=True
+        conn, household_id, user_id, messages, facts, custom_action_texts, language, resumed=True
     )
 
 
-def _process_utterance(conn, household_id: str, user_id: str, text: str) -> str:
+def _process_utterance(conn, household_id: str, user_id: str, text: str, language: str) -> str:
     """Shared pipeline for a typed message: resumes a pending custom-
     action confirmation or clarification if one's outstanding, then
     runs the interactive tool loop. Returns the response text."""
     pending_action = _pending_custom_actions.pop(user_id, None)
     if pending_action is not None and time.time() - pending_action.asked_at < PENDING_CLARIFICATION_TTL_SECONDS:
-        result = _resume_custom_action(conn, household_id, user_id, pending_action, text)
+        result = _resume_custom_action(conn, household_id, user_id, pending_action, text, language)
     else:
         pending = _pending_clarifications.get(user_id)
         is_fresh_pending = (
@@ -492,12 +535,12 @@ def _process_utterance(conn, household_id: str, user_id: str, text: str) -> str:
             and time.time() - pending.asked_at < PENDING_CLARIFICATION_TTL_SECONDS
         )
         messages = (pending.messages if is_fresh_pending else []) + [{"role": "user", "content": text}]
-        result = _run_tool_loop(conn, household_id, user_id, messages)
+        result = _run_tool_loop(conn, household_id, user_id, messages, language)
 
     if isinstance(result, PendingCustomAction):
         _pending_custom_actions[user_id] = result
         question = generate_reply(
-            None, [{"action": "confirm_custom_action", "description": result.description}]
+            None, [{"action": "confirm_custom_action", "description": result.description}], language
         )
         _notify_telegram_confirmation(conn, household_id, question)
         return question
@@ -522,13 +565,60 @@ def post_utterance(
 
     conn = get_connection()
     try:
-        response_text = _process_utterance(conn, household_id, "api-test", text)
+        household = HouseholdRepository(conn).get(household_id)
+        response_text = _process_utterance(conn, household_id, "api-test", text, household.language)
         return {"response": response_text}
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def _onboard_household(conn, chat: dict, fields: dict) -> None:
+    """Creates a new household from a parsed onboarding reply (see
+    llm.parse_onboarding_reply), then sends a confirmation back. A bad
+    timezone falls back to the default rather than rejecting the whole
+    request; the magic word itself is checked by the caller before this
+    is reached."""
+    chat_id = str(chat["id"])
+    name = fields["household_name"]
+    timezone_arg = fields.get("timezone", "")
+    language_arg = fields.get("language", "")
+
+    kwargs = {"name": name, "telegram_chat_id": chat_id}
+    if timezone_arg:
+        kwargs["timezone"] = timezone_arg
+    if language_arg:
+        kwargs["language"] = language_arg
+
+    try:
+        household = Household(**kwargs)
+    except ValueError as exc:
+        # Only a bad timezone should ever land here — name and language
+        # are either absent (fine, default applies) or freeform text
+        # (always valid) — so drop just the offending field and retry.
+        if "timezone" in kwargs:
+            kwargs.pop("timezone")
+            household = Household(**kwargs)
+            send_telegram_message(
+                chat_id,
+                f"{timezone_arg!r} isn't a valid timezone name, so I used the "
+                f"default ({household.timezone}) instead. You can message me "
+                "to have it corrected.",
+            )
+        else:
+            send_telegram_message(chat_id, f"Couldn't set up: {exc}")
+            return
+
+    HouseholdRepository(conn).create(household)
+    conn.commit()
+    send_telegram_message(
+        chat_id,
+        f"Household {household.name!r} is set up — timezone {household.timezone}, "
+        f"language {household.language}. You're all set, just tell me what you "
+        "bought or used.",
+    )
 
 
 @app.post("/telegram-webhook")
@@ -556,21 +646,27 @@ def telegram_webhook(update: dict, request: Request):
     try:
         household = HouseholdRepository(conn).get_by_telegram_chat_id(chat_id)
         if household is None:
-            return {"ok": True}  # unrecognized chat; ack and ignore
+            text = message.get("text") or ""
+            fields = _contains_magic_word(text) and parse_onboarding_reply(text)
+            if fields:
+                _onboard_household(conn, message["chat"], fields)
+            else:
+                send_telegram_message(chat_id, ONBOARDING_INSTRUCTIONS)
+            return {"ok": True}  # unrecognized chat; onboarded or shown instructions
 
         photos = message.get("photo")
         text = message.get("text")
         if photos:
             image_bytes = download_telegram_file(photos[-1]["file_id"])  # largest is last
-            calls = receipt.parse_receipt(image_bytes)
+            calls = receipt.parse_receipt(image_bytes, household.language)
             response_text = (
-                _execute_calls(conn, household.id, user_id, None, calls)
+                _execute_calls(conn, household.id, user_id, None, calls, household.language)
                 if calls
-                else generate_reply(None, [{"action": "no_items_found_in_photo"}])
+                else generate_reply(None, [{"action": "no_items_found_in_photo"}], household.language)
             )
             _notify_telegram_confirmation(conn, household.id, response_text)
         elif text:
-            _process_utterance(conn, household.id, user_id, text.strip())
+            _process_utterance(conn, household.id, user_id, text.strip(), household.language)
         return {"ok": True}
     except Exception:
         conn.rollback()

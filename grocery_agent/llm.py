@@ -17,12 +17,11 @@ from openai import OpenAI
 
 load_dotenv()
 
-# RESPONSE_LANGUAGE drives both: clarifying questions get forced into
-# it, and it's also the one canonical language every item name gets
-# normalized to (must be a single fixed language, not "mirror input" —
-# otherwise the same item said in two languages would create two
-# different DB rows). Defaults to English if unset. Not a per-household
-# setting yet — a global default, easy to make one later.
+# The household's language (Household.language) drives both: clarifying
+# questions get forced into it, and it's also the one canonical language
+# every item name gets normalized to (must be a single fixed language,
+# not "mirror input" — otherwise the same item said in two languages
+# would create two different DB rows).
 _PROMPT = (
     "Today is {today}. You parse grocery utterances into tool calls, in {language}.\n\n"
 
@@ -72,8 +71,7 @@ _PROMPT = (
 )
 
 
-def _system_prompt() -> str:
-    language = os.environ.get("RESPONSE_LANGUAGE", "").strip() or "English"
+def _system_prompt(language: str) -> str:
     return _PROMPT.format(language=language, today=date.today().isoformat())
 
 TOOLS = [
@@ -305,20 +303,20 @@ def _client() -> OpenAI:
 
 
 def parse_utterance(
-    utterance: str | list[dict], client: OpenAI | None = None
+    utterance: str | list[dict], language: str, client: OpenAI | None = None
 ) -> ParsedCommand:
     """`utterance` is either a single string (a fresh utterance) or a
     list of {"role", "content"} turns — used to resolve a pending
     clarification as a real conversation (user asked -> assistant
     asked back -> user answered) rather than one mashed-together
-    string."""
+    string. `language` is the requesting household's Household.language."""
     messages = [{"role": "user", "content": utterance}] if isinstance(utterance, str) else utterance
     client = client or _client()
     model = os.environ["LLM_MODEL"]
 
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "system", "content": _system_prompt()}, *messages],
+        messages=[{"role": "system", "content": _system_prompt(language)}, *messages],
         tools=TOOLS,
         tool_choice="auto",
     )
@@ -374,14 +372,17 @@ _REPLY_PROMPT = (
 
 
 def generate_reply(
-    context: str | None, facts: list[dict], client: OpenAI | None = None
+    context: str | None, facts: list[dict], language: str, client: OpenAI | None = None
 ) -> str:
     """Turns the raw facts of what just happened (Python-resolved, since
     only Python has DB access) into the actual reply text — the LLM
-    decides wording/language, not a hardcoded template."""
+    decides wording, not a hardcoded template. `language` (the
+    requesting household's Household.language) is the fallback used
+    when there's no request text to mirror (a receipt photo, a
+    reminder)."""
     client = client or _client()
     model = os.environ["LLM_MODEL"]
-    fallback_language = os.environ.get("RESPONSE_LANGUAGE", "").strip() or "English"
+    fallback_language = language
 
     response = client.chat.completions.create(
         model=model,
@@ -420,3 +421,64 @@ def is_affirmative(text: str, client: OpenAI | None = None) -> bool:
         ],
     )
     return (response.choices[0].message.content or "").strip().upper().startswith("YES")
+
+
+_ONBOARDING_PROMPT = (
+    "Extract a household name and, if given, a timezone and a display "
+    "language from this onboarding message — the sender is answering "
+    "\"what should we call your household, and optionally what timezone "
+    "and language do you want\", in their own words/order/language. "
+    "Resolve a place name to its IANA timezone (e.g. \"Munich\" -> "
+    "\"Europe/Berlin\"). A magic word may also be in the message — ignore "
+    "it, it's handled separately. Call submit_onboarding only if a "
+    "household name is clearly present."
+)
+
+_ONBOARDING_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_onboarding",
+            "description": "Record the extracted onboarding fields.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "household_name": {"type": "string"},
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA name, e.g. America/New_York. Omit if not given.",
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Display language name, e.g. Chinese. Omit if not given.",
+                    },
+                },
+                "required": ["household_name"],
+            },
+        },
+    }
+]
+
+
+def parse_onboarding_reply(text: str, client: OpenAI | None = None) -> dict | None:
+    """Extracts household_name/timezone/language from a free-text
+    onboarding reply — the magic-word check itself stays a deterministic
+    Python string comparison in api.py (only reached once that already
+    passed), so this never influences whether a household actually gets
+    created, only what it's named/configured as. Returns None if no
+    household name was found."""
+    client = client or _client()
+    model = os.environ["LLM_MODEL"]
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _ONBOARDING_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        tools=_ONBOARDING_TOOLS,
+        tool_choice="auto",
+    )
+    tool_calls = response.choices[0].message.tool_calls
+    if not tool_calls:
+        return None
+    return json.loads(tool_calls[0].function.arguments)

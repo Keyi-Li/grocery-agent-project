@@ -112,10 +112,6 @@ action succeeded that ctx has no way to perform or that had no effect.
 Return ONLY the function definition — no explanation, no markdown fences, no other text."""
 
 
-def _codegen_language() -> str:
-    return os.environ.get("RESPONSE_LANGUAGE", "").strip() or "English"
-
-
 @dataclass
 class SandboxCallbackScope:
     household_id: str
@@ -152,13 +148,14 @@ def _llm_client() -> OpenAI:
     )
 
 
-def generate_action_code(description: str, client: OpenAI | None = None) -> str:
+def generate_action_code(description: str, language: str, client: OpenAI | None = None) -> str:
+    """`language` is the requesting household's Household.language."""
     client = client or _llm_client()
     model = os.environ["LLM_MODEL"]
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": _CODEGEN_PROMPT.format(language=_codegen_language())},
+            {"role": "system", "content": _CODEGEN_PROMPT.format(language=language)},
             {"role": "user", "content": description},
         ],
     )

@@ -45,10 +45,6 @@ _PROMPT = (
 )
 
 
-def _language() -> str:
-    return os.environ.get("RESPONSE_LANGUAGE", "").strip() or "English"
-
-
 def _client() -> OpenAI:
     return OpenAI(
         base_url=os.environ["LLM_BASE_URL"],
@@ -56,7 +52,8 @@ def _client() -> OpenAI:
     )
 
 
-def parse_receipt(image_bytes: bytes, client: OpenAI | None = None) -> list[ToolCall]:
+def parse_receipt(image_bytes: bytes, language: str, client: OpenAI | None = None) -> list[ToolCall]:
+    """`language` is the requesting household's Household.language."""
     client = client or _client()
     model = os.environ.get("VISION_MODEL", DEFAULT_VISION_MODEL)
     b64 = base64.b64encode(image_bytes).decode()
@@ -64,7 +61,7 @@ def parse_receipt(image_bytes: bytes, client: OpenAI | None = None) -> list[Tool
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": _PROMPT.format(language=_language())},
+            {"role": "system", "content": _PROMPT.format(language=language)},
             {
                 "role": "user",
                 "content": [

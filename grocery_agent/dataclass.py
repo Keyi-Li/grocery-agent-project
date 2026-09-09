@@ -34,10 +34,17 @@ class Household:
     # household's daily reminder digest. Households can be in different
     # timezones, so this is per-household data, not a global setting.
     timezone: str = "America/New_York"
+    # What language item names get canonicalized to and replies get
+    # written in. Free text (whatever an LLM understands as a language
+    # name), not validated against a fixed list — same reasoning as
+    # timezone: households can differ, so this isn't a global setting.
+    language: str = "English"
 
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ValueError("household name cannot be empty")
+        if not self.language.strip():
+            raise ValueError("household language cannot be empty")
         try:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError:

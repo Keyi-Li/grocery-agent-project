@@ -94,6 +94,7 @@ def run_reminder_check(conn: psycopg.Connection, household_id: str) -> list[str]
                 "stale_items": stale_items,
             }
         ],
+        household.language,
     )
     send_telegram_message(household.telegram_chat_id, message)
 

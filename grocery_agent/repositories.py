@@ -15,6 +15,10 @@ from psycopg.types.json import Json
 from grocery_agent.dataclass import Household, Item, Product, ShoppingListEntry
 
 
+def _row_to_household(row) -> Household:
+    return Household(id=row[0], name=row[1], telegram_chat_id=row[2], timezone=row[3], language=row[4])
+
+
 class HouseholdRepository:
     def __init__(self, conn: psycopg.Connection):
         self._conn = conn
@@ -22,38 +26,43 @@ class HouseholdRepository:
     def create(self, household: Household) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO households (id, name, telegram_chat_id, timezone) "
-                "VALUES (%s, %s, %s, %s)",
-                (household.id, household.name, household.telegram_chat_id, household.timezone),
+                "INSERT INTO households (id, name, telegram_chat_id, timezone, language) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (
+                    household.id,
+                    household.name,
+                    household.telegram_chat_id,
+                    household.timezone,
+                    household.language,
+                ),
             )
 
     def get(self, household_id: str) -> Household | None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT id, name, telegram_chat_id, timezone FROM households WHERE id = %s",
+                "SELECT id, name, telegram_chat_id, timezone, language FROM households WHERE id = %s",
                 (household_id,),
             )
             row = cur.fetchone()
-        return Household(id=row[0], name=row[1], telegram_chat_id=row[2], timezone=row[3]) if row else None
+        return _row_to_household(row) if row else None
 
     def get_by_telegram_chat_id(self, chat_id: str) -> Household | None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT id, name, telegram_chat_id, timezone FROM households WHERE telegram_chat_id = %s",
+                "SELECT id, name, telegram_chat_id, timezone, language FROM households "
+                "WHERE telegram_chat_id = %s",
                 (str(chat_id),),
             )
             row = cur.fetchone()
-        return Household(id=row[0], name=row[1], telegram_chat_id=row[2], timezone=row[3]) if row else None
+        return _row_to_household(row) if row else None
 
     def get_all(self) -> list[Household]:
         """Every household on record — used by the scheduled reminder
         check, which has no single household to scope to."""
         with self._conn.cursor() as cur:
-            cur.execute("SELECT id, name, telegram_chat_id, timezone FROM households")
+            cur.execute("SELECT id, name, telegram_chat_id, timezone, language FROM households")
             rows = cur.fetchall()
-        return [
-            Household(id=r[0], name=r[1], telegram_chat_id=r[2], timezone=r[3]) for r in rows
-        ]
+        return [_row_to_household(r) for r in rows]
 
 
 class InventoryRepository:

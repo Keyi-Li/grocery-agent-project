@@ -11,7 +11,10 @@ CREATE TABLE IF NOT EXISTS households (
     telegram_chat_id text,
     -- IANA name (e.g. "America/New_York") — what "6pm" means for this
     -- household's daily reminder digest.
-    timezone text NOT NULL DEFAULT 'America/New_York'
+    timezone text NOT NULL DEFAULT 'America/New_York',
+    -- What language item names get canonicalized to and replies get
+    -- written in. Free text, not a fixed enum.
+    language text NOT NULL DEFAULT 'English'
 );
 
 -- The shared canonical catalog — one row per concept
