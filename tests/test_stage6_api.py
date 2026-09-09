@@ -29,6 +29,25 @@ def _fake_generate_reply(context, facts):
     return "\n".join(json.dumps(f, ensure_ascii=False) for f in facts)
 
 
+def _once(calls=(), clarification=None):
+    """A parse_utterance replacement returning the given result on the
+    FIRST invocation only, then "done" (empty calls) on every
+    invocation after. The real tool loop calls parse_utterance
+    repeatedly, feeding real results back each round — a mock that
+    always returns the same non-empty calls would fire them
+    MAX_TOOL_LOOP_ITERATIONS times instead of the single round these
+    tests actually mean to exercise."""
+    state = {"called": False}
+
+    def fake(messages):
+        if state["called"]:
+            return ParsedCommand(calls=[])
+        state["called"] = True
+        return ParsedCommand(calls=list(calls), clarification=clarification)
+
+    return fake
+
+
 @pytest.fixture
 def household(db_conn):
     # The API endpoint opens its own connection per request, so this
@@ -105,7 +124,7 @@ def test_add_item_end_to_end(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "apple", "quantity": 3})]),
+        _once([ToolCall("add_item", {"name": "apple", "quantity": 3}, call_id="c1")]),
     )
 
     response = client.post("/utterance", json={"text": "I bought 3 apples"})
@@ -119,11 +138,12 @@ def test_add_item_with_explicit_purchase_date(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(
-            calls=[
+        _once(
+            [
                 ToolCall(
                     "add_item",
                     {"name": "rice", "quantity": 1, "purchase_date": "2026-01-01"},
+                    call_id="c1",
                 )
             ]
         ),
@@ -139,10 +159,10 @@ def test_multiple_calls_in_one_utterance_are_all_executed(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(
-            calls=[
-                ToolCall("add_item", {"name": "bread", "quantity": 1}),
-                ToolCall("add_item", {"name": "cookie", "quantity": 1}),
+        _once(
+            [
+                ToolCall("add_item", {"name": "bread", "quantity": 1}, call_id="c1"),
+                ToolCall("add_item", {"name": "cookie", "quantity": 1}, call_id="c2"),
             ]
         ),
     )
@@ -158,7 +178,7 @@ def test_multiple_calls_in_one_utterance_are_all_executed(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(calls=[ToolCall("query_stock", {})]),
+        _once([ToolCall("query_stock", {}, call_id="c1")]),
     )
     stock = client.post("/utterance", json={"text": "what do I have"}).json()["response"]
     assert "bread" in stock
@@ -169,14 +189,14 @@ def test_query_stock_after_add(client, monkeypatch):
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "milk", "quantity": 2})]),
+        _once([ToolCall("add_item", {"name": "milk", "quantity": 2}, call_id="c1")]),
     )
     client.post("/utterance", json={"text": "I bought 2 milk"})
 
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(calls=[ToolCall("query_stock", {})]),
+        _once([ToolCall("query_stock", {}, call_id="c1")]),
     )
     response = client.post("/utterance", json={"text": "what do I have"})
 
@@ -188,31 +208,42 @@ def test_clarification_flow_resolves_on_next_utterance(client, household, monkey
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "apple", "quantity": 5})]),
+        _once([ToolCall("add_item", {"name": "apple", "quantity": 5}, call_id="c1")]),
     )
     client.post("/utterance", json={"text": "I bought 5 apples"})
 
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(calls=[], clarification="How many apples did you eat?"),
+        # A clarification (no calls) short-circuits the loop on round 1
+        # regardless — no repeat risk here, unlike the tool-call mocks.
+        lambda messages: ParsedCommand(calls=[], clarification="How many apples did you eat?"),
     )
     first = client.post("/utterance", json={"text": "I ate an apple"})
     assert first.json()["response"] == "How many apples did you eat?"
     assert "api-test" in api_module._pending_clarifications
 
-    seen_text = {}
+    seen_messages = {}
+    call_count = {"n": 0}
 
-    def fake_parse(text):
-        seen_text["value"] = text
-        return ParsedCommand(calls=[ToolCall("consume_item", {"name": "apple", "quantity": 1})])
+    def fake_parse(messages):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            seen_messages["value"] = list(messages)  # snapshot -- the loop
+            # keeps appending to this same list object after this call
+            # returns, so capturing the reference itself would see later
+            # mutations by assertion time.
+            return ParsedCommand(
+                calls=[ToolCall("consume_item", {"name": "apple", "quantity": 1}, call_id="c1")]
+            )
+        return ParsedCommand(calls=[])  # signal "done" so the loop doesn't repeat the consume
 
     monkeypatch.setattr(api_module, "parse_utterance", fake_parse)
     second = client.post("/utterance", json={"text": "one"})
 
     assert second.status_code == 200
     assert "1" in second.json()["response"]
-    assert seen_text["value"] == [
+    assert seen_messages["value"] == [
         {"role": "user", "content": "I ate an apple"},
         {"role": "assistant", "content": "How many apples did you eat?"},
         {"role": "user", "content": "one"},
@@ -235,7 +266,7 @@ def test_response_is_also_sent_to_telegram_when_household_has_a_chat_id(
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "bread", "quantity": 1})]),
+        _once([ToolCall("add_item", {"name": "bread", "quantity": 1}, call_id="c1")]),
     )
 
     try:
@@ -261,7 +292,7 @@ def test_telegram_webhook_processes_message_and_replies(household_with_telegram,
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "tofu", "quantity": 1})]),
+        _once([ToolCall("add_item", {"name": "tofu", "quantity": 1}, call_id="c1")]),
     )
 
     with TestClient(api_module.app) as client:
@@ -291,7 +322,7 @@ def test_telegram_webhook_attributes_action_to_sender(household_with_telegram, m
     monkeypatch.setattr(
         api_module,
         "parse_utterance",
-        lambda text: ParsedCommand(calls=[ToolCall("add_item", {"name": "tofu", "quantity": 1})]),
+        _once([ToolCall("add_item", {"name": "tofu", "quantity": 1}, call_id="c1")]),
     )
 
     with TestClient(api_module.app) as client:

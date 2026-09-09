@@ -5,7 +5,7 @@ directly, and a household's membership is just whoever's in its
 Telegram group. Run:
 
     python scripts/setup_household.py --household-name "The Lis" \\
-        [--telegram-chat-id -100123456789]
+        [--telegram-chat-id -100123456789] [--timezone America/New_York]
 
 Run scripts/get_telegram_chat_id.py first if you don't have the chat
 id yet (or omit it and set it later via HouseholdRepository).
@@ -28,12 +28,21 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--household-name", required=True)
     parser.add_argument("--telegram-chat-id", default=None)
+    parser.add_argument(
+        "--timezone",
+        default="America/New_York",
+        help="IANA name (e.g. America/Los_Angeles) — what \"6pm\" means for "
+        "this household's daily reminder digest. Defaults to America/New_York "
+        "if omitted.",
+    )
     args = parser.parse_args()
 
     conn = get_connection()
     try:
         household = Household(
-            name=args.household_name, telegram_chat_id=args.telegram_chat_id
+            name=args.household_name,
+            telegram_chat_id=args.telegram_chat_id,
+            timezone=args.timezone,
         )
         HouseholdRepository(conn).create(household)
         conn.commit()

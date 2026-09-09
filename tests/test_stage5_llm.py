@@ -1,7 +1,8 @@
 """Tests for the LLM parsing layer (grocery_agent.llm).
 
-These call the real OpenRouter API (OPENROUTER_API_KEY from .env) — no
-mocking, since the whole point is verifying the model's behavior.
+These call the real LLM API (LLM_BASE_URL/LLM_API_KEY/LLM_MODEL from
+.env) — no mocking, since the whole point is verifying the model's
+behavior.
 
 Item names canonicalize to RESPONSE_LANGUAGE (Chinese, per .env), not
 English — see grocery_agent.llm._system_prompt.

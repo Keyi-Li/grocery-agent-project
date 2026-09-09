@@ -8,10 +8,13 @@
 CREATE TABLE IF NOT EXISTS households (
     id uuid PRIMARY KEY,
     name text NOT NULL,
-    telegram_chat_id text
+    telegram_chat_id text,
+    -- IANA name (e.g. "America/New_York") — what "6pm" means for this
+    -- household's daily reminder digest.
+    timezone text NOT NULL DEFAULT 'America/New_York'
 );
 
--- The shared canonical catalog (Section 3a) — one row per concept
+-- The shared canonical catalog — one row per concept
 -- ("苹果"), reused across every household. Just a naming lookup: no
 -- per-household preference belongs here (see `items.stale_after_days`
 -- below for why).

@@ -25,7 +25,17 @@ def _use_str_uuids(conn: psycopg.Connection) -> psycopg.Connection:
 
 
 def get_connection() -> psycopg.Connection:
-    return _use_str_uuids(psycopg.connect(os.environ["DATABASE_URL"]))
+    # prepare_threshold=None disables psycopg's client-side auto-prepared
+    # statements. DATABASE_URL goes through Supabase's transaction-mode
+    # pooler, which can hand a logical connection different underlying
+    # Postgres backends between transactions — a prepared-statement name
+    # from one backend can then collide with a stale one left on
+    # another ("DuplicatePreparedStatement"). Not needed on
+    # get_direct_connection: DIRECT_URL is session-mode (one dedicated
+    # backend per connection), so this can't happen there.
+    return _use_str_uuids(
+        psycopg.connect(os.environ["DATABASE_URL"], prepare_threshold=None)
+    )
 
 
 def get_direct_connection() -> psycopg.Connection:

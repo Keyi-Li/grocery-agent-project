@@ -15,6 +15,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import date
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Allowed values for ShoppingListEntry.source.
 ALLOWED_SHOPPING_LIST_SOURCES = {"auto", "manual"}
@@ -29,17 +30,26 @@ class Household:
     name: str
     id: str = field(default_factory=_new_id)
     telegram_chat_id: str | None = None
+    # IANA name (e.g. "America/New_York") — what "6pm" means for this
+    # household's daily reminder digest. Households can be in different
+    # timezones, so this is per-household data, not a global setting.
+    timezone: str = "America/New_York"
 
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ValueError("household name cannot be empty")
+        try:
+            ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError:
+            raise ValueError(f"not a real IANA timezone name: {self.timezone!r}") from None
 
 
 @dataclass
 class Product:
-    """The shared canonical catalog — one row per concept (e.g. "苹果"),
-    reused across every household, purely a naming lookup so "milk"
-    and "牛奶" resolve to the same row."""
+    """The shared canonical catalog — one row per concept (e.g. milk),
+    reused across every household, purely a naming lookup so the same
+    item named differently (a synonym, or a different input language)
+    resolves to the same row."""
 
     name: str
     id: str = field(default_factory=_new_id)
@@ -51,11 +61,7 @@ class Product:
 
 @dataclass
 class Item:
-    """The real, concrete stock: one row per purchase, per household.
-    `stale_after_days` lives here rather than on `Product` because
-    it's a per-household preference, not a shared catalog fact — two
-    households tracking the same product must be able to set their
-    own staleness threshold independently."""
+    """The real, concrete stock: one row per purchase, per household."""
 
     household_id: str
     product_id: str

@@ -22,28 +22,38 @@ class HouseholdRepository:
     def create(self, household: Household) -> None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO households (id, name, telegram_chat_id) "
-                "VALUES (%s, %s, %s)",
-                (household.id, household.name, household.telegram_chat_id),
+                "INSERT INTO households (id, name, telegram_chat_id, timezone) "
+                "VALUES (%s, %s, %s, %s)",
+                (household.id, household.name, household.telegram_chat_id, household.timezone),
             )
 
     def get(self, household_id: str) -> Household | None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT id, name, telegram_chat_id FROM households WHERE id = %s",
+                "SELECT id, name, telegram_chat_id, timezone FROM households WHERE id = %s",
                 (household_id,),
             )
             row = cur.fetchone()
-        return Household(id=row[0], name=row[1], telegram_chat_id=row[2]) if row else None
+        return Household(id=row[0], name=row[1], telegram_chat_id=row[2], timezone=row[3]) if row else None
 
     def get_by_telegram_chat_id(self, chat_id: str) -> Household | None:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT id, name, telegram_chat_id FROM households WHERE telegram_chat_id = %s",
+                "SELECT id, name, telegram_chat_id, timezone FROM households WHERE telegram_chat_id = %s",
                 (str(chat_id),),
             )
             row = cur.fetchone()
-        return Household(id=row[0], name=row[1], telegram_chat_id=row[2]) if row else None
+        return Household(id=row[0], name=row[1], telegram_chat_id=row[2], timezone=row[3]) if row else None
+
+    def get_all(self) -> list[Household]:
+        """Every household on record — used by the scheduled reminder
+        check, which has no single household to scope to."""
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT id, name, telegram_chat_id, timezone FROM households")
+            rows = cur.fetchall()
+        return [
+            Household(id=r[0], name=r[1], telegram_chat_id=r[2], timezone=r[3]) for r in rows
+        ]
 
 
 class InventoryRepository:
@@ -53,7 +63,12 @@ class InventoryRepository:
     def __init__(self, conn: psycopg.Connection):
         self._conn = conn
 
+    # --- products (shared catalog: name <-> id) ---------------------
+
     def get_or_create_product(self, name: str) -> Product:
+        """name -> id, creating the catalog row the first time an item
+        is ever mentioned. Called wherever a tool receives a raw `name`
+        string from the LLM."""
         with self._conn.cursor() as cur:
             cur.execute("SELECT id, name FROM products WHERE name = %s", (name,))
             row = cur.fetchone()
@@ -67,10 +82,29 @@ class InventoryRepository:
         return product
 
     def get_product(self, product_id: str) -> Product | None:
+        """id -> name, read-only. Called wherever code already has a
+        product_id (from a fetched Item or ShoppingListEntry) and needs
+        it back as a display name."""
         with self._conn.cursor() as cur:
             cur.execute("SELECT id, name FROM products WHERE id = %s", (product_id,))
             row = cur.fetchone()
         return Product(id=row[0], name=row[1]) if row else None
+
+    def get_all_products_for_household(self, household_id: str) -> list[Product]:
+        """Every product that has at least one item (of any quantity) in
+        this household — used by tool functions to enumerate stock
+        without the caller naming a product."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT products.id, products.name "
+                "FROM products JOIN items ON items.product_id = products.id "
+                "WHERE items.household_id = %s",
+                (household_id,),
+            )
+            rows = cur.fetchall()
+        return [Product(id=r[0], name=r[1]) for r in rows]
+
+    # --- items (per-household stock: one row per purchase) ----------
 
     def add_item(self, item: Item) -> None:
         with self._conn.cursor() as cur:
@@ -117,13 +151,22 @@ class InventoryRepository:
             for r in rows
         ]
 
-    def save_item_quantity(self, item: Item) -> None:
-        """Persist an item's current in-memory quantity (e.g. after
-        services.consume_from_items mutated it) back to its row."""
+    def update_item(self, item: Item) -> None:
+        """Persist an item's current in-memory state — quantity (e.g.
+        after services.consume_from_items mutated it), and/or a
+        purchase_date/expiry_date/stale_after_days correction — back to
+        its row. Always writes all four mutable columns"""
         with self._conn.cursor() as cur:
             cur.execute(
-                "UPDATE items SET quantity = %s WHERE id = %s",
-                (item.quantity, item.id),
+                "UPDATE items SET quantity = %s, purchase_date = %s, "
+                "expiry_date = %s, stale_after_days = %s WHERE id = %s",
+                (
+                    item.quantity,
+                    item.purchase_date,
+                    item.expiry_date,
+                    item.stale_after_days,
+                    item.id,
+                ),
             )
 
     def delete_item(self, item_id: str) -> None:
@@ -132,20 +175,6 @@ class InventoryRepository:
         cascade-delete automatically (FK ON DELETE CASCADE)."""
         with self._conn.cursor() as cur:
             cur.execute("DELETE FROM items WHERE id = %s", (item_id,))
-
-    def get_all_products_for_household(self, household_id: str) -> list[Product]:
-        """Every product that has at least one item (of any quantity) in
-        this household — used by tool functions to enumerate stock
-        without the caller naming a product."""
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT DISTINCT products.id, products.name "
-                "FROM products JOIN items ON items.product_id = products.id "
-                "WHERE items.household_id = %s",
-                (household_id,),
-            )
-            rows = cur.fetchall()
-        return [Product(id=r[0], name=r[1]) for r in rows]
 
 
 class ShoppingListRepository:
@@ -205,7 +234,7 @@ class ReminderStateRepository:
             "active": row[4],
         }
 
-    def upsert(
+    def update(
         self, item_id: str, reminder_type: str, last_sent_at: datetime, active: bool = True
     ) -> None:
         existing = self.get(item_id, reminder_type)

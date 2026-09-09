@@ -26,11 +26,18 @@ USER_ID = "test-user"
 def mock_generate_reply(monkeypatch):
     # generate_reply is itself LLM-backed (live-tested in
     # test_stage5_llm.py) — deterministic here so reminder-logic
-    # assertions (which fact fired, how many times) aren't at the
-    # mercy of the model's exact wording.
-    monkeypatch.setattr(
-        reminders_module, "generate_reply", lambda context, facts: f"{facts[0]['name']}: {facts[0]['action']}"
-    )
+    # assertions (which items fired, how many times) aren't at the
+    # mercy of the model's exact wording. Mirrors the real
+    # reminder_digest fact shape (item names live inside
+    # expiring_items/stale_items, not at the top level).
+    def fake_generate_reply(context, facts):
+        fact = facts[0]
+        names = [i["name"] for i in fact.get("expiring_items", [])] + [
+            i["name"] for i in fact.get("stale_items", [])
+        ]
+        return f"{', '.join(names)}: {fact['action']}"
+
+    monkeypatch.setattr(reminders_module, "generate_reply", fake_generate_reply)
 
 
 @pytest.fixture
@@ -138,7 +145,7 @@ def test_staleness_reminder_repeats_after_interval(
 
     # Simulate the repeat interval having elapsed.
     reminder_repo = ReminderStateRepository(db_conn)
-    reminder_repo.upsert(
+    reminder_repo.update(
         item.id,
         "staleness",
         last_sent_at=datetime.now(timezone.utc) - timedelta(days=3),

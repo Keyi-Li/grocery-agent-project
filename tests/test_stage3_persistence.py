@@ -100,7 +100,7 @@ def test_item_carries_stale_after_days(db_conn):
     assert fetched.stale_after_days == 2
 
 
-def test_save_item_quantity_persists_mutation(db_conn):
+def test_update_item_persists_quantity_mutation(db_conn):
     household = make_household(db_conn)
     repo = InventoryRepository(db_conn)
     product = repo.get_or_create_product("eggs")
@@ -114,7 +114,7 @@ def test_save_item_quantity_persists_mutation(db_conn):
     repo.add_item(item)
 
     item.quantity = 6
-    repo.save_item_quantity(item)
+    repo.update_item(item)
 
     fetched = repo.get_items(household.id, product.id)[0]
     assert fetched.quantity == 6

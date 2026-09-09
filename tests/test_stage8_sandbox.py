@@ -19,10 +19,10 @@ from grocery_agent.db import get_connection
 from grocery_agent.llm import ParsedCommand, ToolCall
 from grocery_agent.repositories import ActionLogRepository, HouseholdRepository
 from grocery_agent.sandbox import (
-    generate_code,
-    issue_sandbox_token,
-    resolve_sandbox_token,
-    revoke_sandbox_token,
+    generate_action_code,
+    issue_sandbox_callback_token,
+    resolve_sandbox_callback_token,
+    revoke_sandbox_callback_token,
     run_in_sandbox,
     validate_generated_code,
 )
@@ -56,17 +56,17 @@ def test_validate_rejects_bad_code(code):
 
 
 def test_sandbox_token_round_trip():
-    token = issue_sandbox_token("household-1", "user-1")
-    scope = resolve_sandbox_token(token)
+    token = issue_sandbox_callback_token("household-1", "user-1")
+    scope = resolve_sandbox_callback_token(token)
     assert scope.household_id == "household-1"
     assert scope.user_id == "user-1"
 
-    revoke_sandbox_token(token)
-    assert resolve_sandbox_token(token) is None
+    revoke_sandbox_callback_token(token)
+    assert resolve_sandbox_callback_token(token) is None
 
 
 def test_resolve_unknown_token_returns_none():
-    assert resolve_sandbox_token("not-a-real-token") is None
+    assert resolve_sandbox_callback_token("not-a-real-token") is None
 
 
 # --- run_in_sandbox (real Modal, no network calls) ------------------------
@@ -76,17 +76,17 @@ def test_run_in_sandbox_executes_real_modal_container():
     result = run_in_sandbox(
         'def run(ctx):\n    return "hello from sandbox"',
         base_url="http://unused.invalid",
-        token="unused",
+        callback_token="unused",
         timeout=60,
     )
     assert result == "hello from sandbox"
 
 
-# --- generate_code (real LLM) ----------------------------------------------
+# --- generate_action_code (real LLM) ----------------------------------------------
 
 
 def test_generate_code_produces_valid_run_function():
-    code = generate_code("清空我所有的库存")  # "clear all my stock"
+    code = generate_action_code("清空我所有的库存")  # "clear all my stock"
     validate_generated_code(code)  # raises if invalid
     assert "ctx." in code
 
@@ -113,13 +113,13 @@ def household(db_conn):
 
 @pytest.fixture
 def sandbox_client(household):
-    token = issue_sandbox_token(household.id, USER_ID)
+    token = issue_sandbox_callback_token(household.id, USER_ID)
     try:
         with TestClient(api_module.app) as client:
             client.headers.update({"Authorization": f"Bearer {token}"})
             yield client
     finally:
-        revoke_sandbox_token(token)
+        revoke_sandbox_callback_token(token)
 
 
 def test_sandbox_endpoints_require_valid_token():
@@ -180,7 +180,7 @@ def test_run_custom_action_logs_and_returns_sandbox_result(db_conn, monkeypatch)
 
     try:
         monkeypatch.setattr(
-            sandbox_module, "generate_code", lambda description: "def run(ctx):\n    return 'done'"
+            sandbox_module, "generate_action_code", lambda description: "def run(ctx):\n    return 'done'"
         )
         monkeypatch.setattr(
             sandbox_module, "run_in_sandbox", lambda code, base_url, token, timeout=60: "库存已清空"
@@ -215,14 +215,21 @@ def test_custom_action_dispatched_from_utterance(monkeypatch):
     try:
         api_module.app.dependency_overrides[api_module.verify_api_token] = lambda: household.id
         api_module._pending_clarifications.clear()
+        # The tool loop calls parse_utterance repeatedly (once per
+        # round), feeding real results back each time — so a mock that
+        # always returns the same call would fire it MAX_TOOL_LOOP_ITERATIONS
+        # times, not once. messages has exactly 1 entry (just the
+        # original user message) only on the first round.
         monkeypatch.setattr(
             api_module,
             "parse_utterance",
-            lambda text: ParsedCommand(
-                calls=[ToolCall("custom_action", {"description": "清空库存"})]
-            ),
+            lambda messages: ParsedCommand(
+                calls=[ToolCall("custom_action", {"description": "清空库存"}, call_id="call_1")]
+            )
+            if len(messages) == 1
+            else ParsedCommand(calls=[]),
         )
-        monkeypatch.setattr(sandbox_module, "generate_code", lambda description: "def run(ctx):\n    return 'x'")
+        monkeypatch.setattr(sandbox_module, "generate_action_code", lambda description: "def run(ctx):\n    return 'x'")
         monkeypatch.setattr(
             sandbox_module, "run_in_sandbox", lambda code, base_url, token, timeout=60: "已完成自定义操作"
         )

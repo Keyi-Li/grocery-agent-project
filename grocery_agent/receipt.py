@@ -1,11 +1,11 @@
 """Receipt photo parsing.
 
 A photo sent to the household's Telegram group is downloaded, sent to
-a vision-capable model via OpenRouter, and parsed into add_item tool
-calls — reusing the same canonicalization/language rule as the main
-text parser (grocery_agent.llm), since this is a separate LLM call
-with its own prompt and doesn't inherit that instruction automatically
-(see the sandbox codegen prompt's own note about this same gap).
+a vision-capable model, and parsed into add_item tool calls — reusing
+the same canonicalization/language rule as the main text parser
+(grocery_agent.llm), since this is a separate LLM call with its own
+prompt and doesn't inherit that instruction automatically (see the
+sandbox codegen prompt's own note about this same gap).
 """
 
 from __future__ import annotations
@@ -36,10 +36,9 @@ _PROMPT = (
     "(YYYY-MM-DD), if you can find one — otherwise null (it'll default to today, "
     "which is wrong if this receipt is from an earlier day, so look carefully).\n"
     "- Normalize each name to one canonical {language} word, regardless of what "
-    "language the receipt is printed in (e.g. \"milk\" and \"牛奶\" both become the "
-    "same {language} word) — this must match how items are already named "
-    "elsewhere in this system, so always translate to {language}, never leave "
-    "the receipt's original language as-is.\n"
+    "language the receipt is printed in — this must match how items are "
+    "already named elsewhere in this system, so always translate to "
+    "{language}, never leave the receipt's original language as-is.\n"
     "- Skip non-item lines: tax, subtotal, total, discounts, store name, "
     "payment info.\n\n"
     "Return ONLY the JSON array — no explanation, no markdown fences."
@@ -52,8 +51,8 @@ def _language() -> str:
 
 def _client() -> OpenAI:
     return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=os.environ["OPENROUTER_API_KEY"],
+        base_url=os.environ["LLM_BASE_URL"],
+        api_key=os.environ["LLM_API_KEY"],
     )
 
 

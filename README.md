@@ -10,16 +10,25 @@ Chinese) via an LLM, no fixed command syntax.
 
 - **Telegram** is the only front end — one bot, one group chat per
   household. Text and receipt photos both go through the same webhook.
-- **OpenRouter** provides the LLM: one call parses an utterance into
-  tool calls (add/consume/query), a second turns the result into a
-  reply in the same language as the request. Receipt photos go through
-  a vision-capable model instead.
+- **Any OpenAI-compatible LLM endpoint** (`LLM_BASE_URL`) parses each
+  request through a multi-turn tool-calling loop — the model can see
+  the real result of one call before deciding the next (e.g. "clear
+  the shopping list" = look it up, then remove each item), rather than
+  guessing everything up front. A separate call phrases the final
+  reply, in the same language as the request. Receipt photos go
+  through a vision-capable model instead.
+- **A sandboxed fallback** (Modal) handles requests no predefined tool
+  covers: a small generated Python script runs in an isolated sandbox
+  with no DB credentials, calling back into a narrow internal API.
+  Anything the generated code would actually write to the database
+  pauses for a human "confirm?" in Telegram before it runs — read-only
+  requests run immediately.
 - **Postgres (via Supabase)** is the datastore — plain hosted Postgres,
   no Supabase Auth; identity comes directly from Telegram.
-- **Modal** runs a sandboxed fallback for requests no predefined tool
-  covers (e.g. "clear all my stock"): a small generated Python script
-  runs in an isolated sandbox with no DB credentials, calling back into
-  a narrow internal API.
+- **Scheduled reminders**: each household has its own timezone: once a
+  day, at 6pm in *their* local time, they get one digest message
+  listing anything expiring soon or gone untouched for a while —
+  decoupled from whether anyone's actually used the bot that day.
 - **Fly.io** hosts the FastAPI app.
 
 ## Prerequisites
@@ -27,9 +36,11 @@ Chinese) via an LLM, no fixed command syntax.
 - Python 3.11+
 - A [Supabase](https://supabase.com) project (free tier is fine)
 - A [Telegram bot](https://core.telegram.org/bots#botfather) token from `@BotFather`
-- An [OpenRouter](https://openrouter.ai/keys) API key
+- An API key for an OpenAI-compatible LLM endpoint — [OpenRouter](https://openrouter.ai/keys)
+  is the simplest starting point; any compatible endpoint works
 - A [Modal](https://modal.com) account and API token
 - A [Fly.io](https://fly.io) account, for deployment
+- A GitHub Actions-enabled fork/clone of this repo, for scheduled reminders
 
 ## Setup
 
@@ -46,8 +57,9 @@ Chinese) via an LLM, no fixed command syntax.
    ```
 
    Fill in every value in `.env` — each one has a comment explaining
-   where to get it. `API_DEFAULT_HOUSEHOLD_ID` is filled in during step
-   4, so leave it blank for now.
+   where to get it. `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` are
+   all required (no fallback if left blank). `API_DEFAULT_HOUSEHOLD_ID`
+   is filled in during step 4, so leave it blank for now.
 
 3. **Create the database schema**
 
@@ -61,11 +73,14 @@ Chinese) via an LLM, no fixed command syntax.
 4. **Create a household**
 
    ```bash
-   python scripts/setup_household.py --household-name "The Lis"
+   python scripts/setup_household.py --household-name "The Lis" \
+     --timezone "America/New_York"
    ```
 
-   This prints a household id — put it in `.env` as
-   `API_DEFAULT_HOUSEHOLD_ID`.
+   `--timezone` is optional (an IANA name; defaults to
+   `America/New_York`) — it's what "6pm" means for that household's
+   daily reminder digest. This prints a household id — put it in
+   `.env` as `API_DEFAULT_HOUSEHOLD_ID`.
 
 5. **Connect Telegram**
 
@@ -110,6 +125,22 @@ python scripts/set_telegram_webhook.py https://<your-app>.fly.dev
 After that, messages sent in the household's Telegram group are
 delivered to `/telegram-webhook` on your deployed app.
 
+### Scheduled reminders
+
+Reminders are intentionally decoupled from user requests (a household
+that never messages the bot should still get notified). A GitHub
+Actions workflow (`.github/workflows/check-reminders.yml`) calls
+`POST /internal/check_reminders` every hour; the endpoint itself only
+actually sends a digest to a household when it's currently their
+configured local hour, so one shared hourly trigger still lands once a
+day per household regardless of timezone. To activate it:
+
+1. Push this repo to GitHub (the workflow only runs once it's on the
+   default branch).
+2. Add `CRON_SECRET` (the same value as in your `.env`/Fly secrets) as
+   a GitHub Actions repository secret: **Settings → Secrets and
+   variables → Actions → New repository secret**.
+
 ## Tests
 
 ```bash
@@ -117,5 +148,5 @@ pytest
 ```
 
 Most tests run against the real Supabase project in `.env` (each test
-rolls back its own transaction) and the real OpenRouter API, so
-`.env` must be fully configured before running the suite.
+rolls back its own transaction) and the real LLM API, so `.env` must
+be fully configured before running the suite.
