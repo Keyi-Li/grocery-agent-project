@@ -140,13 +140,3 @@ day per household regardless of timezone. To activate it:
 2. Add `CRON_SECRET` (the same value as in your `.env`/Fly secrets) as
    a GitHub Actions repository secret: **Settings → Secrets and
    variables → Actions → New repository secret**.
-
-## Tests
-
-```bash
-pytest
-```
-
-Most tests run against the real Supabase project in `.env` (each test
-rolls back its own transaction) and the real LLM API, so `.env` must
-be fully configured before running the suite.
