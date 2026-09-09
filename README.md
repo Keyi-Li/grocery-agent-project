@@ -1,22 +1,66 @@
 # Grocery Agent
 
-A Telegram-based grocery inventory tracker. Send it a message ("bought
-2 apples", "used the milk") or a photo of a receipt in your household's
-Telegram group, and it keeps track of what you have, what's expiring,
-and what you're running low on — parsing natural language (English or
-Chinese) via an LLM, no fixed command syntax.
+A Telegram-based grocery inventory tracker. Talk to it in your
+household's Telegram group ("bought 2 apples", "used 3 eggs") and it
+keeps track of what you have, what's expiring, and what you're running
+low on — parsing natural language (English or Chinese) via an LLM, no
+fixed command syntax.
 
-## How it works
+## Usage
 
-- **Telegram** is the only front end — one bot, one group chat per
-  household. Text and receipt photos both go through the same webhook.
+### Adding a new household
+
+No setup script, no admin needed — add the bot to your household's
+Telegram group and send any message. An unrecognized chat gets walked
+through setup automatically: it replies with instructions, and you
+reply with the magic word (ask whoever invited you), your household's
+name, and optionally a timezone and display language, in your own
+words — e.g. "`<magic word>`, we're the Lees, Munich, German". Each
+household gets its own timezone (for when its daily digest arrives)
+and its own display language.
+
+### Talking to it
+
+Just talk normally — there's no fixed command syntax, and it
+understands relative dates, spelled-out quantities, and multiple
+languages. A few examples of what actually happens:
+
+- **Recording a purchase**: "bought 2 apples", "got a dozen eggs
+  yesterday".
+- **Recording use**: "used 3 eggs", "finished the last 2 apples" — if
+  that brings an item to zero, it's automatically added to the
+  shopping list.
+- **Correcting a record**: "actually I bought the milk 3 days ago" —
+  updates the existing entry rather than recording a second purchase.
+- **Shopping list**: "add rice to the list", "what's on the shopping
+  list" (shows what you added manually vs. what got added
+  automatically from running out), "clear the list".
+- **Checking stock**: "how much milk do I have", "what's expiring
+  soon".
+- **Anything else**: a question or request with no fixed command still
+  works — e.g. "how many days until the eggs would expire if I'd
+  bought them 3 days later" — by generating and running a small
+  one-off script instead. If that would actually change your data, it
+  asks you to confirm first rather than doing it silently.
+
+### Daily reminders
+
+Once a day, at 6pm in your household's own timezone, you get one
+digest message listing anything expiring soon or sitting unused for a
+while — this happens regardless of whether anyone's messaged the bot
+that day.
+
+## Under the hood
+
+- **Telegram** is the only front end — one bot, many group chats (one
+  per household). Text and receipt photos both go through the same
+  webhook.
 - **Any OpenAI-compatible LLM endpoint** (`LLM_BASE_URL`) parses each
   request through a multi-turn tool-calling loop — the model can see
   the real result of one call before deciding the next (e.g. "clear
   the shopping list" = look it up, then remove each item), rather than
   guessing everything up front. A separate call phrases the final
-  reply, in the same language as the request. Receipt photos go
-  through a vision-capable model instead.
+  reply, in the same language as the request.
 - **A sandboxed fallback** (Modal) handles requests no predefined tool
   covers: a small generated Python script runs in an isolated sandbox
   with no DB credentials, calling back into a narrow internal API.
@@ -70,33 +114,31 @@ Chinese) via an LLM, no fixed command syntax.
    psql "$DIRECT_URL" -f grocery_agent/schema.sql
    ```
 
-4. **Create a household**
+4. **Create a household and connect Telegram**
+
+   See "Adding a new household" under Usage above — that's enough for
+   real use, and needs no script. (Change `MAGIC_WORD` in
+   `grocery_agent/api.py` before deploying somewhere others might find
+   the bot.) Skip ahead to step 5 unless you also want a household id
+   for `/utterance` testing (below), in which case use the manual path
+   instead:
 
    ```bash
    python scripts/setup_household.py --household-name "The Lis" \
-     --timezone "America/New_York"
+     --timezone "America/New_York" --language "English"
    ```
 
-   `--timezone` is optional (an IANA name; defaults to
-   `America/New_York`) — it's what "6pm" means for that household's
-   daily reminder digest. This prints a household id — put it in
-   `.env` as `API_DEFAULT_HOUSEHOLD_ID`.
+   `--timezone`/`--language` are optional (default `America/New_York`
+   and `English`). This prints a household id — put it in `.env` as
+   `API_DEFAULT_HOUSEHOLD_ID`. To also connect this household to
+   Telegram, get its chat id first — create the group, add the bot,
+   send any message, then run `python scripts/get_telegram_chat_id.py`
+   — and pass it as `--telegram-chat-id` in the *same* command above;
+   the script only ever inserts a new row, so running it a second time
+   to attach a chat id creates a duplicate household rather than
+   updating the first one.
 
-5. **Connect Telegram**
-
-   - Create your household's Telegram group and add the bot to it.
-   - Send any message in the group, then run:
-
-     ```bash
-     python scripts/get_telegram_chat_id.py
-     ```
-
-     to find its chat id.
-   - Save that chat id on the household row (re-run
-     `setup_household.py` with `--telegram-chat-id`, or update the row
-     directly).
-
-6. **Run it locally**
+5. **Run it locally**
 
    ```bash
    uvicorn grocery_agent.api:app --reload --port 8080
