@@ -3,27 +3,25 @@
 A Telegram-based grocery inventory tracker. Talk to it in your
 household's Telegram group ("bought 2 apples", "used 3 eggs") and it
 keeps track of what you have, what's expiring, and what you're running
-low on — parsing natural language (English or Chinese) via an LLM, no
+low on — parsing natural language via an LLM, no
 fixed command syntax.
 
 ## Usage
 
 ### Adding a new household
 
-No setup script, no admin needed — add the bot to your household's
+Add the bot(@ProspectGroceryBot) to your household's
 Telegram group and send any message. An unrecognized chat gets walked
 through setup automatically: it replies with instructions, and you
 reply with the magic word (ask whoever invited you), your household's
 name, and optionally a timezone and display language, in your own
-words — e.g. "`<magic word>`, we're the Lees, Munich, German". Each
+words. Each
 household gets its own timezone (for when its daily digest arrives)
 and its own display language.
 
 ### Talking to it
 
-Just talk normally — there's no fixed command syntax, and it
-understands relative dates, spelled-out quantities, and multiple
-languages. A few examples of what actually happens:
+Just talk normally — there's no fixed command syntax. A few examples of what actually happens:
 
 - **Recording a purchase**: "bought 2 apples", "got a dozen eggs
   yesterday".
@@ -47,14 +45,12 @@ languages. A few examples of what actually happens:
 
 Once a day, at 6pm in your household's own timezone, you get one
 digest message listing anything expiring soon or sitting unused for a
-while — this happens regardless of whether anyone's messaged the bot
-that day.
+while.
 
 ## Under the hood
 
 - **Telegram** is the only front end — one bot, many group chats (one
-  per household). Text and receipt photos both go through the same
-  webhook.
+  per household). 
 - **Any OpenAI-compatible LLM endpoint** (`LLM_BASE_URL`) parses each
   request through a multi-turn tool-calling loop — the model can see
   the real result of one call before deciding the next (e.g. "clear
