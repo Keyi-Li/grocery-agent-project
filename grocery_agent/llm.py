@@ -238,11 +238,20 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "focus_items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Specific items the household explicitly "
+                        "wants the recipe to use, e.g. \"a recipe with milk and "
+                        "eggs\" -> [\"milk\", \"eggs\"]. Omit for a general "
+                        "\"what can I make\" request with nothing named.",
+                    },
                     "preference": {
                         "type": "string",
-                        "description": "Any stated constraint, e.g. \"quick\" or "
-                        "\"vegetarian\". Omit if none was given.",
-                    }
+                        "description": "Any non-item constraint, e.g. \"quick\" "
+                        "or \"vegetarian\" — not a specific ingredient, that "
+                        "goes in focus_items instead. Omit if none was given.",
+                    },
                 },
                 "required": [],
             },

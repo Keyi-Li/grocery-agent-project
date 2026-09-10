@@ -282,32 +282,43 @@ RECIPE_MATCH_MAX_DISTANCE = 0.3
 # How many candidate recipes each individual stock item (or the stated
 # preference) contributes to the vote pool.
 RECIPE_VOTES_PER_ITEM_K = 5
-# A recipe must be a close match (RECIPE_MATCH_MAX_DISTANCE) for at
-# least this many distinct things actually in stock to surface at all
-# — one vague match isn't enough. Retune after more real usage.
+# A recipe must accumulate at least this much vote weight (see
+# FOCUS_ITEM_VOTE_WEIGHT below) to surface at all — one vague match
+# isn't enough. Retune after more real usage.
 RECIPE_MIN_VOTES = 2
+# An explicitly named "use this" item's vote counts this many times a
+# regular stock item's — >= RECIPE_MIN_VOTES on its own, so naming one
+# thing is enough to surface a recipe for it without needing
+# corroboration from unrelated stock, while unnamed items still
+# participate normally rather than being excluded.
+FOCUS_ITEM_VOTE_WEIGHT = 2
 
 
 def suggest_recipes(
-    conn: psycopg.Connection, household_id: str, preference: str | None = None
+    conn: psycopg.Connection,
+    household_id: str,
+    preference: str | None = None,
+    focus_items: list[str] | None = None,
 ) -> list[dict]:
     """Retrieval-augmented recipe suggestion. Embedding the whole stock
     as one combined query was tried first and rejected: a long, diverse
     ingredient list compresses into a generic "diverse grocery list"
     vector that sits vaguely close to nearly every recipe, drowning out
     the signal a threshold needs to work with. Instead, each stock item
-    (+ the stated preference, if any) is searched separately — short,
-    specific queries discriminate well — and a recipe only surfaces if
-    it's a close match (RECIPE_MATCH_MAX_DISTANCE) for at least
-    RECIPE_MIN_VOTES distinct things actually in stock, ranked by vote
-    count then by its single best match. Still fully embedding-based
-    (no lexical/keyword overlap), so this works the same regardless of
-    what language the household's item names are in. The LLM never
-    invents a recipe here — only these real, retrieved ones ever reach
-    it (see llm.generate_reply)."""
+    is searched separately — short, specific queries discriminate well
+    — and a recipe only surfaces once its accumulated vote weight clears
+    RECIPE_MIN_VOTES, ranked by weight then by its single best match.
+    `focus_items` (things the household explicitly asked to use) get
+    weighted more heavily rather than replacing the rest of the stock —
+    a request naming nothing behaves exactly as if every item weighed
+    the same, no separate code path. Still fully embedding-based (no
+    lexical/keyword overlap), so this works the same regardless of what
+    language the household's item names are in. The LLM never invents a
+    recipe here — only these real, retrieved ones ever reach it (see
+    llm.generate_reply)."""
     in_stock = query_stock(conn, household_id)
-    if not in_stock:
-        return []
+    focus_items = focus_items or []
+    tracked_names = {item["name"] for item in in_stock}
 
     # "Ingredients: {name}." rather than the bare name — matches the
     # sentence shape recipes were embedded in at ingestion time (see
@@ -316,24 +327,54 @@ def suggest_recipes(
     # model clearly does understand cross-lingual synonyms in isolation
     # (checked directly) — the ingestion-time and query-time text just
     # need to look like the same kind of sentence.
-    voter_texts = [f"Ingredients: {item['name']}." for item in in_stock]
+    voters: list[tuple[str, float, bool]] = [
+        (
+            f"Ingredients: {item['name']}.",
+            FOCUS_ITEM_VOTE_WEIGHT if item["name"] in focus_items else 1,
+            item["name"] in focus_items,
+        )
+        for item in in_stock
+    ]
+    # A focus item not currently tracked as stock still gets searched —
+    # the household may be asking about something they have but never
+    # recorded, or plan to buy.
+    voters += [
+        (f"Ingredients: {name}.", FOCUS_ITEM_VOTE_WEIGHT, True)
+        for name in focus_items
+        if name not in tracked_names
+    ]
     if preference:
-        voter_texts.append(f"Preference: {preference}.")
+        voters.append((f"Preference: {preference}.", 1, False))
+    if not voters:
+        return []
 
     recipe_repo = RecipeRepository(conn)
-    votes: dict[str, int] = {}
+    votes: dict[str, float] = {}
     best_distance: dict[str, float] = {}
+    matched_focus_item: dict[str, bool] = {}
     recipes_by_id: dict[str, object] = {}
 
-    for embedding in embed_batch(voter_texts):
+    texts = [text for text, _, _ in voters]
+    weights = [weight for _, weight, _ in voters]
+    is_focus_flags = [is_focus for _, _, is_focus in voters]
+    for weight, is_focus, embedding in zip(weights, is_focus_flags, embed_batch(texts)):
         for recipe, distance in recipe_repo.search_with_distance(
             embedding, k=RECIPE_VOTES_PER_ITEM_K, max_distance=RECIPE_MATCH_MAX_DISTANCE
         ):
-            votes[recipe.id] = votes.get(recipe.id, 0) + 1
+            votes[recipe.id] = votes.get(recipe.id, 0) + weight
             best_distance[recipe.id] = min(best_distance.get(recipe.id, distance), distance)
+            matched_focus_item[recipe.id] = matched_focus_item.get(recipe.id, False) or is_focus
             recipes_by_id[recipe.id] = recipe
 
-    finalists = [rid for rid, count in votes.items() if count >= RECIPE_MIN_VOTES]
+    # With focus_items named, a recipe must actually match at least one
+    # of them to be eligible at all — a named item is a requirement, not
+    # just a bigger vote, so it can't be outvoted by broad partial
+    # overlap accumulated across everything else in stock.
+    finalists = [
+        rid
+        for rid, count in votes.items()
+        if count >= RECIPE_MIN_VOTES and (not focus_items or matched_focus_item.get(rid))
+    ]
     finalists.sort(key=lambda rid: (-votes[rid], best_distance[rid]))
 
     return [

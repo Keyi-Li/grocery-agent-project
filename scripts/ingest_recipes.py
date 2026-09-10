@@ -56,6 +56,14 @@ def _download_rows() -> list[dict]:
             return list(reader)
 
 
+# Recipes with very few ingredients (e.g. "bagel, onion") embed as a
+# vague, generic vector that ends up coincidentally close to a huge
+# range of unrelated queries — found in practice, they dominate
+# suggest_recipes' vote counts without being genuinely relevant to
+# anything. ~4% of the corpus falls below this; worth the loss.
+MIN_NER_INGREDIENTS = 4
+
+
 def _embed_text(name: str, ner: str) -> str:
     # `ner` is the dataset's extracted-ingredient-names field (clean, no
     # quantities/units) — embedded instead of the raw `ingredients` text
@@ -98,6 +106,8 @@ def main() -> None:
         ner = row["ner"].strip()
         if not (name and ingredients and steps and ner):
             continue  # every row in this dataset is clean, but don't trust that blindly
+        if len([x for x in ner.split(",") if x.strip()]) < MIN_NER_INGREDIENTS:
+            continue  # too sparse — see MIN_NER_INGREDIENTS
 
         batch_recipes.append(Recipe(name=name, ingredients=ingredients, steps=steps))
         batch_texts.append(_embed_text(name, ner))
