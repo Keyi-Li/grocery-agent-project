@@ -326,17 +326,26 @@ class RecipeRepository:
                 (recipe.id, recipe.name, recipe.ingredients, recipe.steps, embedding),
             )
 
-    def search(self, query_embedding: list[float], k: int = 5) -> list[Recipe]:
+    def search(
+        self, query_embedding: list[float], k: int = 5, max_distance: float | None = None
+    ) -> list[Recipe]:
         """Top-k recipes by cosine distance to query_embedding — pure
         vector math (the pgvector `<=>` operator), no LLM involved. The
         explicit ::vector cast is required: outside an INSERT's column
         context, psycopg has nothing to infer this parameter's type
-        from and defaults to a plain array, which `<=>` doesn't accept."""
+        from and defaults to a plain array, which `<=>` doesn't accept.
+
+        `max_distance` filters out weak matches rather than always
+        returning k results regardless of relevance — omit for
+        unfiltered top-k (e.g. exploratory/debugging use)."""
+        query = "SELECT id, name, ingredients, steps FROM recipes "
+        params: list = []
+        if max_distance is not None:
+            query += "WHERE embedding <=> %s::vector < %s "
+            params += [query_embedding, max_distance]
+        query += "ORDER BY embedding <=> %s::vector LIMIT %s"
+        params += [query_embedding, k]
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, name, ingredients, steps FROM recipes "
-                "ORDER BY embedding <=> %s::vector LIMIT %s",
-                (query_embedding, k),
-            )
+            cur.execute(query, params)
             rows = cur.fetchall()
         return [Recipe(id=r[0], name=r[1], ingredients=r[2], steps=r[3]) for r in rows]

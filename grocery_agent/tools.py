@@ -272,13 +272,25 @@ def query_expiring_soon(conn: psycopg.Connection, household_id: str) -> list[dic
     return result
 
 
+# Cosine-distance cutoff for suggest_recipes — below ~0.24 in practice
+# for genuinely relevant matches, above ~0.37 for clearly unrelated
+# ones (checked empirically against the real corpus, see the recipe
+# feature's design discussion). Excluding weak matches rather than
+# always returning k results regardless of relevance means an
+# unmatchable stock correctly comes back empty instead of forcing a
+# loose "sort of related" suggestion. Retune after more real usage.
+RECIPE_MATCH_MAX_DISTANCE = 0.3
+
+
 def suggest_recipes(
     conn: psycopg.Connection, household_id: str, preference: str | None = None
 ) -> list[dict]:
     """Retrieval-augmented recipe suggestion: builds a query from the
     household's actual current stock (+ an optional stated preference),
     embeds it, and retrieves the k most similar real recipes from the
-    corpus (RecipeRepository, populated by scripts/ingest_recipes.py).
+    corpus (RecipeRepository, populated by scripts/ingest_recipes.py) —
+    below RECIPE_MATCH_MAX_DISTANCE only, so a stock nothing actually
+    matches comes back empty rather than forcing a loose suggestion.
     The LLM never invents a recipe here — only these real, retrieved
     ones ever reach it (see llm.generate_reply)."""
     in_stock = query_stock(conn, household_id)
@@ -286,7 +298,9 @@ def suggest_recipes(
     if preference:
         query_text += f" Preference: {preference}."
 
-    recipes = RecipeRepository(conn).search(embed(query_text), k=3)
+    recipes = RecipeRepository(conn).search(
+        embed(query_text), k=3, max_distance=RECIPE_MATCH_MAX_DISTANCE
+    )
     return [
         {"name": r.name, "ingredients": r.ingredients, "steps": r.steps} for r in recipes
     ]
