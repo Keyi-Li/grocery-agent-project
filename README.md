@@ -172,15 +172,12 @@ delivered to `/telegram-webhook` on your deployed app.
 ### Scheduled reminders
 
 Reminders are intentionally decoupled from user requests (a household
-that never messages the bot should still get notified). A GitHub
-Actions workflow (`.github/workflows/check-reminders.yml`) calls
-`POST /internal/check_reminders` every hour; the endpoint itself only
-actually sends a digest to a household when it's currently their
-configured local hour, so one shared hourly trigger still lands once a
-day per household regardless of timezone. To activate it:
-
-1. Push this repo to GitHub (the workflow only runs once it's on the
-   default branch).
-2. Add `CRON_SECRET` (the same value as in your `.env`/Fly secrets) as
-   a GitHub Actions repository secret: **Settings → Secrets and
-   variables → Actions → New repository secret**.
+that never messages the bot should still get notified). Something
+external needs to call `POST /internal/check_reminders` (protected by
+`CRON_SECRET`) roughly hourly — the endpoint itself only actually
+sends a digest to a household when it's currently their configured
+local hour, so one shared hourly trigger still lands once a day per
+household regardless of timezone. Any hourly scheduler works — a
+GitHub Actions workflow on a `schedule: cron` trigger is one
+straightforward option if you don't already have a server to run a
+cron job on directly.
