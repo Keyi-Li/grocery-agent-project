@@ -12,7 +12,7 @@ from datetime import date
 import psycopg
 
 from grocery_agent.dataclass import Item, ShoppingListEntry
-from grocery_agent.embeddings import embed
+from grocery_agent.embeddings import embed_batch
 from grocery_agent.repositories import (
     ActionLogRepository,
     InventoryRepository,
@@ -272,35 +272,75 @@ def query_expiring_soon(conn: psycopg.Connection, household_id: str) -> list[dic
     return result
 
 
-# Cosine-distance cutoff for suggest_recipes — below ~0.24 in practice
-# for genuinely relevant matches, above ~0.37 for clearly unrelated
-# ones (checked empirically against the real corpus, see the recipe
-# feature's design discussion). Excluding weak matches rather than
-# always returning k results regardless of relevance means an
-# unmatchable stock correctly comes back empty instead of forcing a
-# loose "sort of related" suggestion. Retune after more real usage.
+# Cosine-distance cutoff for one item's own search — below ~0.24 in
+# practice for a genuinely relevant match, above ~0.37 for a clearly
+# unrelated one (checked empirically, short/specific queries only —
+# see the recipe feature's design discussion for why this doesn't hold
+# for one big combined-stock query, which is why suggest_recipes
+# doesn't build one).
 RECIPE_MATCH_MAX_DISTANCE = 0.3
+# How many candidate recipes each individual stock item (or the stated
+# preference) contributes to the vote pool.
+RECIPE_VOTES_PER_ITEM_K = 5
+# A recipe must be a close match (RECIPE_MATCH_MAX_DISTANCE) for at
+# least this many distinct things actually in stock to surface at all
+# — one vague match isn't enough. Retune after more real usage.
+RECIPE_MIN_VOTES = 2
 
 
 def suggest_recipes(
     conn: psycopg.Connection, household_id: str, preference: str | None = None
 ) -> list[dict]:
-    """Retrieval-augmented recipe suggestion: builds a query from the
-    household's actual current stock (+ an optional stated preference),
-    embeds it, and retrieves the k most similar real recipes from the
-    corpus (RecipeRepository, populated by scripts/ingest_recipes.py) —
-    below RECIPE_MATCH_MAX_DISTANCE only, so a stock nothing actually
-    matches comes back empty rather than forcing a loose suggestion.
-    The LLM never invents a recipe here — only these real, retrieved
-    ones ever reach it (see llm.generate_reply)."""
+    """Retrieval-augmented recipe suggestion. Embedding the whole stock
+    as one combined query was tried first and rejected: a long, diverse
+    ingredient list compresses into a generic "diverse grocery list"
+    vector that sits vaguely close to nearly every recipe, drowning out
+    the signal a threshold needs to work with. Instead, each stock item
+    (+ the stated preference, if any) is searched separately — short,
+    specific queries discriminate well — and a recipe only surfaces if
+    it's a close match (RECIPE_MATCH_MAX_DISTANCE) for at least
+    RECIPE_MIN_VOTES distinct things actually in stock, ranked by vote
+    count then by its single best match. Still fully embedding-based
+    (no lexical/keyword overlap), so this works the same regardless of
+    what language the household's item names are in. The LLM never
+    invents a recipe here — only these real, retrieved ones ever reach
+    it (see llm.generate_reply)."""
     in_stock = query_stock(conn, household_id)
-    query_text = "Available ingredients: " + ", ".join(item["name"] for item in in_stock) + "."
-    if preference:
-        query_text += f" Preference: {preference}."
+    if not in_stock:
+        return []
 
-    recipes = RecipeRepository(conn).search(
-        embed(query_text), k=3, max_distance=RECIPE_MATCH_MAX_DISTANCE
-    )
+    # "Ingredients: {name}." rather than the bare name — matches the
+    # sentence shape recipes were embedded in at ingestion time (see
+    # scripts/ingest_recipes.py). A bare word embeds meaningfully worse
+    # with this model than the same word in that shape, even when the
+    # model clearly does understand cross-lingual synonyms in isolation
+    # (checked directly) — the ingestion-time and query-time text just
+    # need to look like the same kind of sentence.
+    voter_texts = [f"Ingredients: {item['name']}." for item in in_stock]
+    if preference:
+        voter_texts.append(f"Preference: {preference}.")
+
+    recipe_repo = RecipeRepository(conn)
+    votes: dict[str, int] = {}
+    best_distance: dict[str, float] = {}
+    recipes_by_id: dict[str, object] = {}
+
+    for embedding in embed_batch(voter_texts):
+        for recipe, distance in recipe_repo.search_with_distance(
+            embedding, k=RECIPE_VOTES_PER_ITEM_K, max_distance=RECIPE_MATCH_MAX_DISTANCE
+        ):
+            votes[recipe.id] = votes.get(recipe.id, 0) + 1
+            best_distance[recipe.id] = min(best_distance.get(recipe.id, distance), distance)
+            recipes_by_id[recipe.id] = recipe
+
+    finalists = [rid for rid, count in votes.items() if count >= RECIPE_MIN_VOTES]
+    finalists.sort(key=lambda rid: (-votes[rid], best_distance[rid]))
+
     return [
-        {"name": r.name, "ingredients": r.ingredients, "steps": r.steps} for r in recipes
+        {
+            "name": recipes_by_id[rid].name,
+            "ingredients": recipes_by_id[rid].ingredients,
+            "steps": recipes_by_id[rid].steps,
+        }
+        for rid in finalists[:3]
     ]

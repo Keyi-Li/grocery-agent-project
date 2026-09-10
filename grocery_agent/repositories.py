@@ -349,3 +349,22 @@ class RecipeRepository:
             cur.execute(query, params)
             rows = cur.fetchall()
         return [Recipe(id=r[0], name=r[1], ingredients=r[2], steps=r[3]) for r in rows]
+
+    def search_with_distance(
+        self, query_embedding: list[float], k: int = 5, max_distance: float | None = None
+    ) -> list[tuple[Recipe, float]]:
+        """Same as search, but also returns each result's cosine
+        distance — used by tools.suggest_recipes' per-item voting, which
+        needs the actual distance (to gate) and needs to run this once
+        per stock item rather than once per whole request."""
+        query = "SELECT id, name, ingredients, steps, embedding <=> %s::vector AS distance FROM recipes "
+        params: list = [query_embedding]
+        if max_distance is not None:
+            query += "WHERE embedding <=> %s::vector < %s "
+            params += [query_embedding, max_distance]
+        query += "ORDER BY distance LIMIT %s"
+        params += [k]
+        with self._conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+        return [(Recipe(id=r[0], name=r[1], ingredients=r[2], steps=r[3]), r[4]) for r in rows]
