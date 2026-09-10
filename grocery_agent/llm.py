@@ -358,11 +358,13 @@ def parse_utterance(
 _REPLY_PROMPT = (
     "Report these grocery-inventory facts to the household. They relate to: "
     "{context}\n\n"
-    "Language: match the request's language if it's natural-language text. "
-    "Otherwise — a receipt photo, or a proactive reminder with no request "
-    "behind it — use {fallback_language}. Item names are stored in a fixed "
-    "canonical form; express them naturally in the reply's language rather "
-    "than copying that form verbatim if it doesn't match.\n\n"
+    "Language: always reply in {language} — the household's configured "
+    "language — regardless of what language the request itself is "
+    "written in. Only use a different language if the request "
+    "explicitly asks for one (e.g. \"reply in English\"). Item names "
+    "are stored in a fixed canonical form; express them naturally in "
+    "the reply's language rather than copying that form verbatim if it "
+    "doesn't match.\n\n"
     "Style: one short, terse, information-dense message. No pleasantries, "
     "no explanations — just the facts, one line per fact if there are "
     'several. Examples: "milk +3" for an addition, "eggs -1" for a '
@@ -401,12 +403,11 @@ def generate_reply(
     """Turns the raw facts of what just happened (Python-resolved, since
     only Python has DB access) into the actual reply text — the LLM
     decides wording, not a hardcoded template. `language` (the
-    requesting household's Household.language) is the fallback used
-    when there's no request text to mirror (a receipt photo, a
-    reminder)."""
+    requesting household's Household.language) is always used, even if
+    the request itself was in a different language — see _REPLY_PROMPT's
+    Language rule for the one exception (an explicit ask otherwise)."""
     client = client or _client()
     model = os.environ["LLM_MODEL"]
-    fallback_language = language
 
     response = client.chat.completions.create(
         model=model,
@@ -414,7 +415,7 @@ def generate_reply(
             {
                 "role": "system",
                 "content": _REPLY_PROMPT.format(
-                    context=context or "(no specific request)", fallback_language=fallback_language
+                    context=context or "(no specific request)", language=language
                 ),
             },
             {"role": "user", "content": json.dumps(facts, ensure_ascii=False, default=str)},
