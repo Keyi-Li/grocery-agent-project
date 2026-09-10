@@ -56,12 +56,16 @@ def _download_rows() -> list[dict]:
             return list(reader)
 
 
-# Recipes with very few ingredients (e.g. "bagel, onion") embed as a
-# vague, generic vector that ends up coincidentally close to a huge
-# range of unrelated queries — found in practice, they dominate
-# suggest_recipes' vote counts without being genuinely relevant to
-# anything. ~4% of the corpus falls below this; worth the loss.
-MIN_NER_INGREDIENTS = 4
+# Only the first few `ner` ingredients get embedded, not the whole
+# list — a long ingredient list dilutes a recipe's embedding into a
+# generic "lots of stuff" vector the same way a long combined stock
+# query did (see tools.suggest_recipes' design discussion). `ner`
+# entries tend to run roughly primary-ingredient-first, so this is a
+# cheap way to keep what's actually distinctive about a recipe and
+# drop common trailing seasonings (salt, pepper, oil...) that don't
+# discriminate between recipes. Applies to every recipe uniformly,
+# short or long — nothing is excluded from the corpus by length.
+EMBED_MAX_INGREDIENTS = 3
 
 
 def _embed_text(name: str, ner: str) -> str:
@@ -69,8 +73,11 @@ def _embed_text(name: str, ner: str) -> str:
     # quantities/units) — embedded instead of the raw `ingredients` text
     # since the live query text is built from clean canonical item
     # names too (see tools.suggest_recipes); clean-to-clean should
-    # retrieve better than clean-to-messy.
-    return f"{name}. Ingredients: {ner}"
+    # retrieve better than clean-to-messy. The full `ner`/`ingredients`/
+    # `steps` are still stored as-is for display — only the embedded
+    # text itself is capped.
+    items = [x.strip() for x in ner.split(",") if x.strip()][:EMBED_MAX_INGREDIENTS]
+    return f"{name}. Ingredients: {', '.join(items)}"
 
 
 def main() -> None:
@@ -106,8 +113,6 @@ def main() -> None:
         ner = row["ner"].strip()
         if not (name and ingredients and steps and ner):
             continue  # every row in this dataset is clean, but don't trust that blindly
-        if len([x for x in ner.split(",") if x.strip()]) < MIN_NER_INGREDIENTS:
-            continue  # too sparse — see MIN_NER_INGREDIENTS
 
         batch_recipes.append(Recipe(name=name, ingredients=ingredients, steps=steps))
         batch_texts.append(_embed_text(name, ner))
