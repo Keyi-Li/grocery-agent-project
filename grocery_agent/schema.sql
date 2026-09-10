@@ -5,6 +5,8 @@
 -- whoever is in that Telegram group, which Telegram itself already tracks —
 -- no parallel membership table needed.
 
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE TABLE IF NOT EXISTS households (
     id uuid PRIMARY KEY,
     name text NOT NULL,
@@ -64,4 +66,19 @@ CREATE TABLE IF NOT EXISTS action_log (
     action text NOT NULL,
     details jsonb NOT NULL,
     created_at timestamptz NOT NULL
+);
+
+-- A RAG corpus, not per-household data: one row per recipe, shared by
+-- every household. `embedding` is computed once at ingestion time (see
+-- scripts/ingest_recipes.py) from a multilingual model, so a query built
+-- from a household's own-language item names can still retrieve these
+-- (English-only) recipes via cosine similarity — no ANN index (ivfflat/
+-- hnsw) at this corpus size (~7k rows); a brute-force `<=>` scan is
+-- already sub-10ms.
+CREATE TABLE IF NOT EXISTS recipes (
+    id uuid PRIMARY KEY,
+    name text NOT NULL,
+    ingredients text NOT NULL,
+    steps text NOT NULL,
+    embedding vector(384) NOT NULL
 );

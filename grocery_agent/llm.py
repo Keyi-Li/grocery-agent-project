@@ -233,6 +233,24 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "suggest_recipes",
+            "description": "Suggest real recipes that use what's currently in stock.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "preference": {
+                        "type": "string",
+                        "description": "Any stated constraint, e.g. \"quick\" or "
+                        "\"vegetarian\". Omit if none was given.",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "custom_action",
             "description": (
                 "Last resort ONLY — use when no combination of the other tools "
@@ -367,7 +385,13 @@ _REPLY_PROMPT = (
     "Shopping list:\n"
     "hand soap, rice\n\n"
     "Ran out automatically:\n"
-    "milk, eggs"
+    "milk, eggs\n\n"
+    "A suggest_recipes fact has a recipes list (name, ingredients, "
+    "steps for each, as retrieved real recipes — never invent or alter "
+    "one). List each by name with a one-line paraphrase of how it uses "
+    "what's in stock; don't restate the full ingredients or steps "
+    "verbatim. If the list is empty, say plainly that nothing matched, "
+    "not that stock is empty."
 )
 
 

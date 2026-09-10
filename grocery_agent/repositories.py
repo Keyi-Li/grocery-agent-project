@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import psycopg
 from psycopg.types.json import Json
 
-from grocery_agent.dataclass import Household, Item, Product, ShoppingListEntry
+from grocery_agent.dataclass import Household, Item, Product, Recipe, ShoppingListEntry
 
 
 def _row_to_household(row) -> Household:
@@ -306,3 +306,37 @@ class ActionLogRepository:
             }
             for r in rows
         ]
+
+
+class RecipeRepository:
+    """The recipe RAG corpus (see scripts/ingest_recipes.py) — a shared
+    catalog like `products`, not scoped to household_id. `embedding` is
+    a storage-layer concern only: it goes in on `add`, but `search`
+    never returns it — nothing above this layer should need a raw
+    vector (see grocery_agent.embeddings)."""
+
+    def __init__(self, conn: psycopg.Connection):
+        self._conn = conn
+
+    def add(self, recipe: Recipe, embedding: list[float]) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO recipes (id, name, ingredients, steps, embedding) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (recipe.id, recipe.name, recipe.ingredients, recipe.steps, embedding),
+            )
+
+    def search(self, query_embedding: list[float], k: int = 5) -> list[Recipe]:
+        """Top-k recipes by cosine distance to query_embedding — pure
+        vector math (the pgvector `<=>` operator), no LLM involved. The
+        explicit ::vector cast is required: outside an INSERT's column
+        context, psycopg has nothing to infer this parameter's type
+        from and defaults to a plain array, which `<=>` doesn't accept."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, ingredients, steps FROM recipes "
+                "ORDER BY embedding <=> %s::vector LIMIT %s",
+                (query_embedding, k),
+            )
+            rows = cur.fetchall()
+        return [Recipe(id=r[0], name=r[1], ingredients=r[2], steps=r[3]) for r in rows]

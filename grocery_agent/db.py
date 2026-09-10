@@ -10,6 +10,7 @@ import os
 
 import psycopg
 from dotenv import load_dotenv
+from pgvector.psycopg import register_vector
 from psycopg.types.string import TextLoader
 
 load_dotenv()
@@ -24,6 +25,19 @@ def _use_str_uuids(conn: psycopg.Connection) -> psycopg.Connection:
     return conn
 
 
+def _register_vector_type(conn: psycopg.Connection) -> psycopg.Connection:
+    """Lets recipes.embedding round-trip as a plain list[float] instead of
+    a raw pgvector literal string. Skipped silently if the `vector`
+    extension isn't installed yet (e.g. schema.sql hasn't been applied to
+    this DB yet) — every other table works fine without it; only
+    recipe search needs this."""
+    try:
+        register_vector(conn)
+    except Exception:
+        pass
+    return conn
+
+
 def get_connection() -> psycopg.Connection:
     # prepare_threshold=None disables psycopg's client-side auto-prepared
     # statements. DATABASE_URL goes through Supabase's transaction-mode
@@ -33,10 +47,10 @@ def get_connection() -> psycopg.Connection:
     # another ("DuplicatePreparedStatement"). Not needed on
     # get_direct_connection: DIRECT_URL is session-mode (one dedicated
     # backend per connection), so this can't happen there.
-    return _use_str_uuids(
-        psycopg.connect(os.environ["DATABASE_URL"], prepare_threshold=None)
-    )
+    conn = psycopg.connect(os.environ["DATABASE_URL"], prepare_threshold=None)
+    return _register_vector_type(_use_str_uuids(conn))
 
 
 def get_direct_connection() -> psycopg.Connection:
-    return _use_str_uuids(psycopg.connect(os.environ["DIRECT_URL"]))
+    conn = psycopg.connect(os.environ["DIRECT_URL"])
+    return _register_vector_type(_use_str_uuids(conn))

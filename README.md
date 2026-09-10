@@ -88,7 +88,13 @@ while.
 
    ```bash
    pip install -r requirements.txt
+   pip install -e .
    ```
+
+   The second line makes `grocery_agent` importable from anywhere —
+   without it, running a `scripts/*.py` file directly fails with
+   `ModuleNotFoundError: No module named 'grocery_agent'` (only affects
+   running scripts locally; the deployed app itself doesn't need this).
 
 2. **Configure environment**
 

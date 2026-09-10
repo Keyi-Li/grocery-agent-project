@@ -12,9 +12,11 @@ from datetime import date
 import psycopg
 
 from grocery_agent.dataclass import Item, ShoppingListEntry
+from grocery_agent.embeddings import embed
 from grocery_agent.repositories import (
     ActionLogRepository,
     InventoryRepository,
+    RecipeRepository,
     ShoppingListRepository,
 )
 from grocery_agent.services import (
@@ -268,3 +270,23 @@ def query_expiring_soon(conn: psycopg.Connection, household_id: str) -> list[dic
                     }
                 )
     return result
+
+
+def suggest_recipes(
+    conn: psycopg.Connection, household_id: str, preference: str | None = None
+) -> list[dict]:
+    """Retrieval-augmented recipe suggestion: builds a query from the
+    household's actual current stock (+ an optional stated preference),
+    embeds it, and retrieves the k most similar real recipes from the
+    corpus (RecipeRepository, populated by scripts/ingest_recipes.py).
+    The LLM never invents a recipe here — only these real, retrieved
+    ones ever reach it (see llm.generate_reply)."""
+    in_stock = query_stock(conn, household_id)
+    query_text = "Available ingredients: " + ", ".join(item["name"] for item in in_stock) + "."
+    if preference:
+        query_text += f" Preference: {preference}."
+
+    recipes = RecipeRepository(conn).search(embed(query_text), k=3)
+    return [
+        {"name": r.name, "ingredients": r.ingredients, "steps": r.steps} for r in recipes
+    ]

@@ -100,3 +100,21 @@ class ShoppingListEntry:
                 "source must be one of "
                 f"{sorted(ALLOWED_SHOPPING_LIST_SOURCES)}; got {self.source!r}"
             )
+
+
+@dataclass
+class Recipe:
+    """One row of the recipe RAG corpus (see scripts/ingest_recipes.py) —
+    shared across every household, not per-household data. `embedding`
+    is deliberately not a field here: it's a storage-layer concern
+    (RecipeRepository), not part of the domain model any calling code
+    should need to see or pass around."""
+
+    name: str
+    ingredients: str
+    steps: str
+    id: str = field(default_factory=_new_id)
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("recipe name cannot be empty")

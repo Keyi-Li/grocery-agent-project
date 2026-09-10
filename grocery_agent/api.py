@@ -125,6 +125,7 @@ TOOL_FUNCTIONS = {
     "query_item_details": tools.query_item_details,
     "query_shopping_list": tools.query_shopping_list,
     "query_expiring_soon": tools.query_expiring_soon,
+    "suggest_recipes": tools.suggest_recipes,
 }
 
 
@@ -263,6 +264,8 @@ def _call_to_fact(conn, tool_name: str, arguments: dict, result) -> dict:
                 for r in result
             ],
         }
+    if tool_name == "suggest_recipes":
+        return {"action": tool_name, "recipes": result}
     return {"action": tool_name}
 
 
